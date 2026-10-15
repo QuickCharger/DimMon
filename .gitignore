@@ -1,0 +1,23 @@
+# 构建目录与 CMake 产物
+build/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+
+# 编译产物
+*.exe
+*.o
+*.obj
+*.res
+
+# 日志
+*.log
+
+# 编辑器 / 系统
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

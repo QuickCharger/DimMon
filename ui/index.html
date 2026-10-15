@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>显示器亮度</title>
+<style>
+  :root{
+    --bg:#f5f5f4; --card:#ffffff; --line:#e4e2dd; --txt:#2c2c2a;
+    --muted:#6b6a66; --accent:#185fa5; --accent-soft:#e6f1fb;
+    --ok:#0f6e56; --warn:#a32d2d;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#1c1c1b; --card:#262625; --line:#3a3a38; --txt:#f0efec;
+      --muted:#9c9a95; --accent:#85b7eb; --accent-soft:#0c447c;
+      --ok:#9fe1cb; --warn:#f09595;
+    }
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; padding:28px 20px 40px; background:var(--bg); color:var(--txt);
+    font:14px/1.6 system-ui,"Segoe UI","Microsoft YaHei",sans-serif;
+  }
+  .wrap{max-width:680px;margin:0 auto}
+  header{display:flex;align-items:baseline;gap:12px;margin-bottom:6px}
+  h1{font-size:19px;font-weight:600;margin:0}
+  .sub{color:var(--muted);font-size:13px}
+  .toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:16px 0 20px}
+  .toolbar .label{color:var(--muted);font-size:13px;margin-right:2px}
+  button{
+    font:inherit;font-size:13px;padding:5px 12px;border-radius:8px;cursor:pointer;
+    border:1px solid var(--line);background:var(--card);color:var(--txt);
+  }
+  button:hover{border-color:var(--muted)}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  button.danger{color:var(--warn);border-color:var(--line)}
+  .card{
+    background:var(--card);border:1px solid var(--line);border-radius:12px;
+    padding:16px 18px;margin-bottom:12px;
+  }
+  .card.dead{opacity:.62}
+  .row{display:flex;align-items:center;gap:10px}
+  .name{font-weight:600;font-size:14px}
+  .tag{
+    font-size:11px;padding:1px 8px;border-radius:999px;
+    background:var(--accent-soft);color:var(--accent);white-space:nowrap;
+  }
+  .tag.bad{background:transparent;color:var(--warn);border:1px solid var(--line)}
+  .dev{color:var(--muted);font-size:12px;margin-left:auto;font-variant-numeric:tabular-nums}
+  .pct{
+    font-size:26px;font-weight:600;margin:10px 0 2px;
+    font-variant-numeric:tabular-nums;letter-spacing:-.5px;
+  }
+  .pct small{font-size:14px;font-weight:400;color:var(--muted);margin-left:2px}
+  input[type=range]{
+    -webkit-appearance:none;appearance:none;width:100%;height:22px;background:transparent;margin:0;
+  }
+  input[type=range]::-webkit-slider-runnable-track{
+    height:6px;border-radius:3px;background:var(--line);
+  }
+  input[type=range]::-webkit-slider-thumb{
+    -webkit-appearance:none;width:18px;height:18px;border-radius:50%;
+    background:var(--accent);border:2px solid var(--card);margin-top:-6px;cursor:pointer;
+  }
+  input[type=range]::-moz-range-track{height:6px;border-radius:3px;background:var(--line)}
+  input[type=range]::-moz-range-thumb{
+    width:16px;height:16px;border-radius:50%;background:var(--accent);
+    border:2px solid var(--card);cursor:pointer;
+  }
+  input[type=range]:disabled::-webkit-slider-thumb{background:var(--muted)}
+  input[type=range]:disabled::-moz-range-thumb{background:var(--muted)}
+  .err{color:var(--warn);font-size:12px;margin-top:6px}
+  footer{
+    margin-top:22px;padding-top:14px;border-top:1px solid var(--line);
+    display:flex;align-items:center;gap:12px;color:var(--muted);font-size:12px;
+  }
+  footer .spacer{margin-left:auto}
+  .empty{color:var(--muted);text-align:center;padding:36px 0}
+  .toast{
+    position:fixed;left:50%;bottom:26px;transform:translateX(-50%);
+    background:var(--txt);color:var(--bg);font-size:13px;
+    padding:8px 16px;border-radius:8px;opacity:0;transition:opacity .2s;pointer-events:none;
+  }
+  .toast.show{opacity:.92}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>显示器亮度</h1>
+    <span class="sub" id="status">正在连接…</span>
+  </header>
+
+  <div class="toolbar">
+    <span class="label">全部设为</span>
+    <button onclick="setAll(0)">0%</button>
+    <button onclick="setAll(25)">25%</button>
+    <button onclick="setAll(50)">50%</button>
+    <button onclick="setAll(75)">75%</button>
+    <button onclick="setAll(100)" class="primary">100%</button>
+    <button onclick="load(true)" style="margin-left:auto">刷新</button>
+  </div>
+
+  <div id="list"><div class="empty">正在读取显示器…</div></div>
+
+  <footer>
+    <span id="portInfo"></span>
+    <span class="spacer"></span>
+    <button class="danger" onclick="quitApp()">退出程序</button>
+  </footer>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+var TOKEN = new URLSearchParams(location.search).get('token') || '';
+var dragging = false;
+var timers = {};
+var last = null;
+
+function toast(msg){
+  var t = document.getElementById('toast');
+  t.textContent = msg; t.classList.add('show');
+  clearTimeout(t._h);
+  t._h = setTimeout(function(){ t.classList.remove('show'); }, 1600);
+}
+
+function req(path, opt){
+  opt = opt || {};
+  opt.headers = Object.assign({'X-Token': TOKEN}, opt.headers || {});
+  return fetch(path, opt).then(function(r){
+    if(!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  });
+}
+
+function render(data){
+  last = data;
+  var list = document.getElementById('list');
+  document.getElementById('portInfo').textContent =
+    '本地服务 127.0.0.1:' + data.port + ' · 共 ' + data.monitors.length + ' 个显示器';
+
+  if(!data.monitors.length){
+    list.innerHTML = '<div class="empty">没有找到可控亮度的显示器。<br>' +
+      '如果是虚拟机或远程桌面会话，这是正常的。</div>';
+    return;
+  }
+
+  var html = '';
+  data.monitors.forEach(function(m){
+    var ok = m.ok && m.percent >= 0;
+    var pct = ok ? m.percent : 0;
+    html += '<div class="card' + (ok ? '' : ' dead') + '" data-id="' + m.id + '">'
+      + '<div class="row">'
+      +   '<span class="name">' + esc(m.desc || ('显示器 ' + (m.id + 1))) + '</span>'
+      +   '<span class="tag' + (ok ? '' : ' bad') + '">' + esc(m.method || '不可用') + '</span>'
+      +   '<span class="dev">' + esc(m.device) + '</span>'
+      + '</div>'
+      + '<div class="pct"><span id="v' + m.id + '">' + (ok ? pct : '—') + '</span><small>%</small></div>'
+      + '<input type="range" min="0" max="100" step="1" value="' + pct + '"'
+      +   (ok ? '' : ' disabled')
+      +   ' oninput="onSlide(' + m.id + ', this)"'
+      +   ' onpointerdown="dragging=true" onpointerup="dragging=false; onDrop(' + m.id + ', this)">'
+      + (ok ? '' : '<div class="err">' + esc(m.error || '无法读取亮度') + '</div>')
+      + '</div>';
+  });
+  list.innerHTML = html;
+}
+
+function esc(s){
+  return String(s).replace(/[&<>"']/g, function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+  });
+}
+
+function onSlide(id, el){
+  document.getElementById('v' + id).textContent = el.value;
+  clearTimeout(timers[id]);
+  timers[id] = setTimeout(function(){ push(id, el.value, false); }, 90);
+}
+
+function onDrop(id, el){
+  clearTimeout(timers[id]);
+  push(id, el.value, true);
+}
+
+function push(id, percent, verbose){
+  req('/api/set', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id:id, percent:Number(percent)})
+  }).then(function(d){
+    applyResult(d);
+    if(verbose) toast('已设为 ' + percent + '%');
+  }).catch(function(e){ toast('设置失败：' + e.message); });
+}
+
+function setAll(p){
+  req('/api/set', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id:-1, percent:p})
+  }).then(function(d){ applyResult(d); toast('全部已设为 ' + p + '%'); })
+    .catch(function(e){ toast('设置失败：' + e.message); });
+}
+
+function applyResult(d){
+  if(!d || !d.monitors) return;
+  last = d;
+  d.monitors.forEach(function(m){
+    var v = document.getElementById('v' + m.id);
+    var card = document.querySelector('.card[data-id="' + m.id + '"]');
+    if(v) v.textContent = (m.ok && m.percent >= 0) ? m.percent : '—';
+    if(card){
+      var sl = card.querySelector('input[type=range]');
+      if(sl && !dragging && m.ok) sl.value = m.percent;
+    }
+  });
+}
+
+function load(verbose){
+  req('/api/state').then(function(d){
+    if(!dragging) render(d);
+    document.getElementById('status').textContent =
+      '已连接 · ' + new Date().toLocaleTimeString('zh-CN');
+    if(verbose) toast('已刷新');
+  }).catch(function(e){
+    document.getElementById('status').textContent = '连接失败：' + e.message;
+  });
+}
+
+function quitApp(){
+  if(!confirm('确定要退出 brightnessctl 后台程序吗？')) return;
+  req('/api/quit', {method:'POST'})
+    .then(function(){ document.body.innerHTML =
+      '<div class="wrap"><div class="empty">程序已退出，可以关闭此页面。</div></div>'; })
+    .catch(function(){ document.body.innerHTML =
+      '<div class="wrap"><div class="empty">程序已退出，可以关闭此页面。</div></div>'; });
+}
+
+load();
+setInterval(function(){ if(!dragging) load(false); }, 3000);
+</script>
+</body>
+</html>
