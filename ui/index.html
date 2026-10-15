@@ -8,13 +8,13 @@
   :root{
     --bg:#f5f5f4; --card:#ffffff; --line:#e4e2dd; --txt:#2c2c2a;
     --muted:#6b6a66; --accent:#185fa5; --accent-soft:#e6f1fb;
-    --ok:#0f6e56; --warn:#a32d2d;
+    --ok:#0f6e56; --warn:#a32d2d; --grid:#eceae5;
   }
   @media (prefers-color-scheme: dark){
     :root{
       --bg:#1c1c1b; --card:#262625; --line:#3a3a38; --txt:#f0efec;
       --muted:#9c9a95; --accent:#85b7eb; --accent-soft:#0c447c;
-      --ok:#9fe1cb; --warn:#f09595;
+      --ok:#9fe1cb; --warn:#f09595; --grid:#323230;
     }
   }
   *{box-sizing:border-box}
@@ -35,6 +35,7 @@
   button:hover{border-color:var(--muted)}
   button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
   button.danger{color:var(--warn);border-color:var(--line)}
+  button:disabled{opacity:.5;cursor:default}
   .card{
     background:var(--card);border:1px solid var(--line);border-radius:12px;
     padding:16px 18px;margin-bottom:12px;
@@ -83,6 +84,39 @@
     padding:8px 16px;border-radius:8px;opacity:0;transition:opacity .2s;pointer-events:none;
   }
   .toast.show{opacity:.92}
+
+  /* ---- 作息曲线 ---- */
+  .sch-head{display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap}
+  .sch-head .title{font-weight:600;font-size:14px}
+  .sch-head .now{
+    font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;
+  }
+  .sch-head .now b{color:var(--accent);font-weight:600}
+  .sw{margin-left:auto;display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer}
+  .sw input{width:15px;height:15px;cursor:pointer}
+  svg.sched{
+    width:100%;height:auto;display:block;user-select:none;
+    touch-action:none;cursor:crosshair;
+  }
+  svg.sched .grid{stroke:var(--grid);stroke-width:1}
+  svg.sched .axis{fill:var(--muted);font-size:10px;font-variant-numeric:tabular-nums}
+  svg.sched .area{fill:var(--accent);opacity:.13}
+  svg.sched .line{fill:none;stroke:var(--accent);stroke-width:2;stroke-linejoin:round}
+  svg.sched .dot{fill:var(--card);stroke:var(--accent);stroke-width:2;cursor:grab}
+  svg.sched .dot:hover{stroke-width:3}
+  svg.sched .dot.act{stroke-width:3}
+  svg.sched .nowline{stroke:var(--warn);stroke-width:1;stroke-dasharray:3 3}
+  svg.sched .nowdot{fill:var(--warn);stroke:var(--card);stroke-width:2}
+  svg.sched .nowlab{fill:var(--warn);font-size:10px;font-variant-numeric:tabular-nums}
+  .sch-tip{color:var(--muted);font-size:12px;margin-top:10px;line-height:1.5}
+  .sch-tip kbd{
+    font:inherit;background:var(--bg);border:1px solid var(--line);
+    border-radius:4px;padding:0 4px;font-size:11px;
+  }
+  .note{
+    margin-top:10px;padding:8px 10px;border-radius:8px;background:var(--accent-soft);
+    color:var(--accent);font-size:12px;line-height:1.5;
+  }
 </style>
 </head>
 <body>
@@ -103,6 +137,34 @@
   </div>
 
   <div id="list"><div class="empty">正在读取显示器…</div></div>
+
+  <!-- ============ 作息曲线 ============ -->
+  <div class="card">
+    <div class="sch-head">
+      <span class="title">作息曲线</span>
+      <span class="now" id="schNow"></span>
+      <label class="sw">
+        <input type="checkbox" id="schOn" onchange="onSchToggle()"> 自动调节
+      </label>
+    </div>
+
+    <svg class="sched" id="schSvg" viewBox="0 0 640 250" preserveAspectRatio="xMidYMid meet"></svg>
+
+    <div class="sch-tip">
+      拖动圆点调整 · 空白处<kbd>点击</kbd>新增控制点 · <kbd>双击</kbd>圆点删除 · 每 15 分钟一档
+    </div>
+
+    <div class="toolbar" style="margin:12px 0 0">
+      <span class="label">预设</span>
+      <button onclick="preset('night')">护眼</button>
+      <button onclick="preset('day')">明亮</button>
+      <button onclick="preset('flat')">平缓</button>
+      <button onclick="applyNow()" style="margin-left:auto">立即应用</button>
+      <button onclick="saveSch()" class="primary">保存</button>
+    </div>
+
+    <div class="note" id="schNote"></div>
+  </div>
 
   <footer>
     <span id="portInfo"></span>
@@ -134,6 +196,15 @@ function req(path, opt){
   });
 }
 
+function esc(s){
+  return String(s).replace(/[&<>"']/g, function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+  });
+}
+
+/* ==========================================================================
+ *  显示器列表
+ * ======================================================================== */
 function render(data){
   last = data;
   var list = document.getElementById('list');
@@ -165,12 +236,6 @@ function render(data){
       + '</div>';
   });
   list.innerHTML = html;
-}
-
-function esc(s){
-  return String(s).replace(/[&<>"']/g, function(c){
-    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
-  });
 }
 
 function onSlide(id, el){
@@ -238,8 +303,271 @@ function quitApp(){
       '<div class="wrap"><div class="empty">程序已退出，可以关闭此页面。</div></div>'; });
 }
 
+/* ==========================================================================
+ *  作息曲线（24 小时亮度曲线编辑器）
+ * --------------------------------------------------------------------------
+ *  数据：{enabled:bool, points:[{x:小时0-24, y:亮度0-100}]}
+ *  曲线在点之间做线性插值；x<第一个点 或 x>最后一个点 时取端点值。
+ * ======================================================================== */
+var SCH = {enabled:false, points:[]};
+var GEO = {L:40, R:12, T:14, B:28, W:588, H:196};   // viewBox 640x250
+var STEP = 0.25;                                     // 15 分钟一档
+var dragIdx = -1;
+var svgEl = null;
+
+var PRESETS = {
+  night: [{x:0,y:20},{x:6,y:20},{x:8,y:55},{x:12,y:75},{x:17,y:60},{x:20,y:35},{x:22,y:25},{x:24,y:20}],
+  day:   [{x:0,y:60},{x:7,y:85},{x:12,y:100},{x:15,y:95},{x:18,y:85},{x:21,y:70},{x:24,y:60}],
+  flat:  [{x:0,y:40},{x:8,y:60},{x:12,y:70},{x:18,y:60},{x:24,y:40}]
+};
+
+function px(h){ return GEO.L + (h / 24) * GEO.W; }
+function py(p){ return GEO.T + (100 - p) / 100 * GEO.H; }
+function invX(x){ return clamp((x - GEO.L) / GEO.W * 24, 0, 24); }
+function invY(y){ return clamp((GEO.T + GEO.H - y) / GEO.H * 100, 0, 100); }
+function clamp(v,a,b){ return v < a ? a : (v > b ? b : v); }
+function snap(v, s){ return Math.round(v / s) * s; }
+
+function sorted(){
+  return SCH.points.slice().sort(function(a,b){ return a.x - b.x; });
+}
+
+/* 求任意时刻的目标亮度（线性插值） */
+function valueAt(h){
+  var p = sorted();
+  if(!p.length) return 100;
+  if(h <= p[0].x) return Math.round(p[0].y);
+  if(h >= p[p.length-1].x) return Math.round(p[p.length-1].y);
+  for(var i = 0; i < p.length - 1; i++){
+    if(h >= p[i].x && h <= p[i+1].x){
+      var span = p[i+1].x - p[i].x;
+      var t = span > 0 ? (h - p[i].x) / span : 0;
+      return Math.round(p[i].y + t * (p[i+1].y - p[i].y));
+    }
+  }
+  return Math.round(p[0].y);
+}
+
+function hhmm(h){
+  var m = Math.round(h * 60);
+  var hh = Math.floor(m / 60), mm = m % 60;
+  if(hh >= 24){ hh = 24; mm = 0; }
+  return (hh < 10 ? '0' : '') + hh + ':' + (mm < 10 ? '0' : '') + mm;
+}
+
+function nowHours(){
+  var d = new Date();
+  return d.getHours() + d.getMinutes() / 60 + d.getSeconds() / 3600;
+}
+
+/* ---------------- 绘制 ---------------- */
+function drawSch(){
+  if(!svgEl) svgEl = document.getElementById('schSvg');
+  var p = sorted();
+  var s = '';
+
+  /* 网格 + 刻度 */
+  for(var h = 0; h <= 24; h += 3){
+    var x = px(h);
+    s += '<line class="grid" x1="' + x + '" y1="' + GEO.T + '" x2="' + x +
+         '" y2="' + (GEO.T + GEO.H) + '"/>';
+    s += '<text class="axis" x="' + x + '" y="' + (GEO.T + GEO.H + 16) +
+         '" text-anchor="middle">' + h + '</text>';
+  }
+  for(var v = 0; v <= 100; v += 25){
+    var y = py(v);
+    s += '<line class="grid" x1="' + GEO.L + '" y1="' + y + '" x2="' +
+         (GEO.L + GEO.W) + '" y2="' + y + '"/>';
+    s += '<text class="axis" x="' + (GEO.L - 7) + '" y="' + (y + 3) +
+         '" text-anchor="end">' + v + '</text>';
+  }
+
+  /* 曲线 + 填充 */
+  if(p.length){
+    var d = '', i;
+    for(i = 0; i < p.length; i++)
+      d += (i ? 'L' : 'M') + px(p[i].x).toFixed(1) + ' ' + py(p[i].y).toFixed(1);
+    var base = GEO.T + GEO.H;
+    s += '<path class="area" d="' + d + 'L' + px(24).toFixed(1) + ' ' + base +
+         'L' + px(0).toFixed(1) + ' ' + base + 'Z"/>';
+    s += '<path class="line" d="' + d + '"/>';
+  }
+
+  /* 当前时刻指示 */
+  var nh = nowHours(), nx = px(nh), ny = py(valueAt(nh));
+  s += '<line class="nowline" x1="' + nx.toFixed(1) + '" y1="' + GEO.T + '" x2="' +
+       nx.toFixed(1) + '" y2="' + (GEO.T + GEO.H) + '"/>';
+  s += '<circle class="nowdot" cx="' + nx.toFixed(1) + '" cy="' + ny.toFixed(1) + '" r="4"/>';
+  s += '<text class="nowlab" x="' + (nx + (nh > 20 ? -6 : 6)).toFixed(1) + '" y="' +
+       (GEO.T + 10) + '" text-anchor="' + (nh > 20 ? 'end' : 'start') + '">' +
+       hhmm(nh) + '</text>';
+
+  /* 控制点 */
+  for(var k = 0; k < p.length; k++){
+    s += '<circle class="dot' + (k === dragIdx ? ' act' : '') + '" data-i="' + k + '" cx="' +
+         px(p[k].x).toFixed(1) + '" cy="' + py(p[k].y).toFixed(1) + '" r="6"/>';
+  }
+
+  svgEl.innerHTML = s;
+  document.getElementById('schNow').innerHTML =
+    '此刻 ' + hhmm(nh) + ' → <b>' + valueAt(nh) + '%</b>';
+}
+
+/* ---------------- 交互 ---------------- */
+function toSvg(evt){
+  var r = svgEl.getBoundingClientRect();
+  var vb = svgEl.viewBox.baseVal;
+  return {
+    x: (evt.clientX - r.left) / r.width * vb.width,
+    y: (evt.clientY - r.top) / r.height * vb.height
+  };
+}
+
+function hitTest(x, y){
+  var p = sorted();
+  for(var i = 0; i < p.length; i++){
+    var dx = px(p[i].x) - x, dy = py(p[i].y) - y;
+    if(dx*dx + dy*dy <= 144) return i;   // 半径 12 内算命中
+  }
+  return -1;
+}
+
+function onDown(e){
+  var c = toSvg(e), i = hitTest(c.x, c.y);
+  if(i >= 0){
+    dragIdx = i;
+    svgEl.setPointerCapture && svgEl.setPointerCapture(e.pointerId);
+    drawSch();
+  }else{
+    /* 空白处点击 = 新增控制点（y 取该时刻曲线上的当前值） */
+    var h = snap(invX(c.x), STEP);
+    SCH.points.push({x:h, y:Math.round(invY(c.y))});
+    var p = sorted();
+    dragIdx = p.findIndex(function(q){ return q.x === h; });
+    SCH.points = p;
+    svgEl.setPointerCapture && svgEl.setPointerCapture(e.pointerId);
+    drawSch();
+  }
+  e.preventDefault();
+}
+
+function onMove(e){
+  if(dragIdx < 0) return;
+  var c = toSvg(e), p = sorted();
+  var h = clamp(snap(invX(c.x), STEP), 0, 24);
+
+  /* 不能越过相邻控制点 */
+  var lo = dragIdx > 0 ? p[dragIdx-1].x + STEP : 0;
+  var hi = dragIdx < p.length-1 ? p[dragIdx+1].x - STEP : 24;
+  if(lo > hi){ lo = hi; }
+  p[dragIdx].x = clamp(h, lo, hi);
+  p[dragIdx].y = Math.round(clamp(invY(c.y), 0, 100));
+  SCH.points = p;
+  drawSch();
+  e.preventDefault();
+}
+
+function onUp(){
+  if(dragIdx < 0) return;
+  dragIdx = -1;
+  drawSch();
+}
+
+function onDbl(e){
+  var c = toSvg(e), i = hitTest(c.x, c.y);
+  if(i < 0) return;
+  if(SCH.points.length <= 2){ toast('至少保留 2 个控制点'); return; }
+  var p = sorted();
+  p.splice(i, 1);
+  SCH.points = p;
+  drawSch();
+  e.preventDefault();
+}
+
+function preset(name){
+  SCH.points = PRESETS[name].map(function(q){ return {x:q.x, y:q.y}; });
+  drawSch();
+  toast('已载入预设：' + ({night:'护眼', day:'明亮', flat:'平缓'}[name]));
+}
+
+function onSchToggle(){
+  SCH.enabled = document.getElementById('schOn').checked;
+  document.getElementById('schNote').innerHTML = SCH.enabled
+    ? '已启用：页面保持打开时，每分钟按曲线自动调节一次。<b>后台（关闭页面也生效）需要 C++ 侧支持，尚未实现。</b>'
+    : '未启用自动调节。';
+}
+
+function applyNow(){
+  var v = valueAt(nowHours());
+  setAll(v);
+}
+
+/* 保存：优先 POST 给后端；后端尚未实现接口时回落到 localStorage */
+function saveSch(){
+  var payload = {
+    enabled: document.getElementById('schOn').checked,
+    points: sorted().map(function(p){
+      return {x: Math.round(p.x*100)/100, y: Math.round(p.y)};
+    })
+  };
+  try{ localStorage.setItem('brightnessctl.schedule', JSON.stringify(payload)); }catch(e){}
+
+  req('/api/schedule', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(payload)
+  }).then(function(){
+    toast('已保存到程序配置');
+    document.getElementById('schNote').textContent =
+      '配置已写入后台程序（关闭页面后依然生效）。';
+  }).catch(function(){
+    toast('已保存到浏览器（后端接口待接入）');
+    document.getElementById('schNote').innerHTML =
+      '已存到浏览器 localStorage。<b>写入程序配置文件需要后端 /api/schedule 接口，下一步实现。</b>';
+  });
+}
+
+/* 页面开着时的自动调节（前端版，后端实现后可去掉） */
+function tickAuto(){
+  if(!document.getElementById('schOn').checked) return;
+  var want = valueAt(nowHours());
+  if(tickAuto._last !== want){
+    tickAuto._last = want;
+    req('/api/set', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id:-1, percent:want})
+    }).then(function(d){ applyResult(d); }).catch(function(){});
+  }
+}
+
+/* ---------------- 初始化 ---------------- */
+(function initSch(){
+  var saved = null;
+  try{ saved = JSON.parse(localStorage.getItem('brightnessctl.schedule')); }catch(e){}
+  if(saved && saved.points && saved.points.length >= 2){
+    SCH.enabled = !!saved.enabled;
+    SCH.points = saved.points.slice();
+  }else{
+    SCH.enabled = false;
+    SCH.points = PRESETS.night.map(function(q){ return {x:q.x, y:q.y}; });
+  }
+  document.getElementById('schOn').checked = SCH.enabled;
+  document.getElementById('schNote').textContent =
+    '拖动曲线上的圆点即可设定全天亮度；点“保存”写入配置。';
+
+  svgEl = document.getElementById('schSvg');
+  svgEl.addEventListener('pointerdown', onDown);
+  svgEl.addEventListener('pointermove', onMove);
+  svgEl.addEventListener('pointerup', onUp);
+  svgEl.addEventListener('pointercancel', onUp);
+  svgEl.addEventListener('dblclick', onDbl);
+  drawSch();
+})();
+
 load();
 setInterval(function(){ if(!dragging) load(false); }, 3000);
+setInterval(function(){ drawSch(); tickAuto(); }, 15000);
 </script>
 </body>
 </html>

@@ -97,6 +97,12 @@ add_executable(brightnessctl
 set_source_files_properties(ui/index.html PROPERTIES HEADER_FILE_ONLY TRUE)
 set_source_files_properties(httpd.h       PROPERTIES HEADER_FILE_ONLY TRUE)
 
+# windres 不会自动扫描 .rc 里引用的外部文件。若不显式声明依赖，改了
+# ui/index.html 之后 .rc 不会重新编译，exe 里内嵌的仍然是旧页面
+# （表现为"改了前端但页面没变化"，且没有任何报错）。
+set_source_files_properties(brightnessctl.rc PROPERTIES
+    OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/ui/index.html;${CMAKE_CURRENT_SOURCE_DIR}/brightnessctl.ico;${CMAKE_CURRENT_SOURCE_DIR}/brightnessctl.manifest")
+
 target_include_directories(brightnessctl PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 
 target_compile_definitions(brightnessctl PRIVATE

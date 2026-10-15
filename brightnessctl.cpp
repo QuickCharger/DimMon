@@ -423,6 +423,7 @@ struct MonInfo {
     bool         primary;
     HANDLE       hPhys;      // 非 WMI 用
     DWORD        caps;
+    DWORD        colorTemps; // GetMonitorCapabilities 的第二个返回值（颜色温度能力）
     bool         hasCaps;
     std::wstring wmiPath;
     std::wstring wmiName;
@@ -432,7 +433,8 @@ struct MonInfo {
     std::string  error;
 
     MonInfo() : id(0), isWmi(false), primary(false), hPhys(NULL), caps(0),
-                hasCaps(false), lo(0), hi(100), percent(-1), ok(false) {}
+                colorTemps(0), hasCaps(false), lo(0), hi(100), percent(-1),
+                ok(false) {}
 };
 
 static std::vector<MonInfo>     g_mons;
@@ -467,7 +469,16 @@ static void CollectMonitors(void)
             m.primary = d.primary;
             m.hPhys   = pm[k].hPhysicalMonitor;
 
-            m.hasCaps = (GetMonitorCapabilities(m.hPhys, &m.caps, NULL) == TRUE);
+            /* 实测结论（2026-10-15，虚拟机 + 真机各一台，probe 命令对照）：
+               第三个参数传 NULL 与传真实变量，行为完全一致 ——
+               失败时都是设备层错误（ERROR_GEN_FAILURE=31 / ERROR_NOT_SUPPORTED=50），
+               Windows 并不会因 NULL 而返回 ERROR_INVALID_PARAMETER。
+               所以这里仍传真实变量，并非为了修 bug，而是：
+                 1) 严格贴合 API 契约（MSDN 未把该参数标为 optional，不像
+                    GetVCPFeatureAndVCPFeatureReply 的 pvct 明确标了 optional）；
+                 2) 顺带把颜色温度能力取回来，用于 list 的诊断输出。 */
+            m.hasCaps = (GetMonitorCapabilities(m.hPhys, &m.caps,
+                                                &m.colorTemps) == TRUE);
 
             DWORD lo = 0, cur = 0, hi = 0, err = 0;
             if (DdcciGetBrightness(m.hPhys, lo, cur, hi, err)) {
@@ -503,7 +514,14 @@ static void CollectMonitors(void)
         m.desc      = "内置屏幕（WMI）";
         m.method    = "WMI";
         m.isWmi     = true;
-        m.primary   = true;
+        /* 主屏标记：DDC/CI 通道里若已经有一个主显示器，WMI 通道就不再标 [主]。
+           早先这里硬编码 true，导致 list 里出现两个 [主]。 */
+        {
+            bool alreadyPrimary = false;
+            for (size_t j = 0; j < g_mons.size(); ++j)
+                if (g_mons[j].primary) { alreadyPrimary = true; break; }
+            m.primary = !alreadyPrimary;
+        }
         m.wmiPath   = wmis[i].path;
         m.wmiName   = wmis[i].name;
         m.lo        = 0;
@@ -826,8 +844,10 @@ static void PrintMonitors(void)
         printf("\n[%d] %s%s\n", m.id + 1, m.desc.c_str(), m.primary ? "  [主]" : "");
         printf("    设备: %s\n", m.device.c_str());
         if (m.hasCaps)
-            printf("    能力位: 0x%08lX%s\n", (unsigned long)m.caps,
-                   (m.caps & MC_CAPS_BRIGHTNESS) ? "  含亮度" : "  不含亮度");
+            printf("    能力位: 0x%08lX%s   颜色温度能力: 0x%04lX\n",
+                   (unsigned long)m.caps,
+                   (m.caps & MC_CAPS_BRIGHTNESS) ? "  含亮度" : "  不含亮度",
+                   (unsigned long)m.colorTemps);
         if (m.ok)
             printf("    通路: %s   raw 范围 %lu-%lu   当前 %d%%\n",
                    m.method.c_str(), (unsigned long)m.lo, (unsigned long)m.hi, m.percent);
@@ -855,6 +875,88 @@ static void SetAllAndPrint(int percent)
         }
     }
     printf(">>> 成功操作 %d 个显示器\n", hit);
+}
+
+/* ---------------------------------------------------------------------------
+ * probe 子命令：DDC/CI 底层诊断
+ *   对每个物理显示器句柄分别用两种写法调 GetMonitorCapabilities，
+ *   并逐条试高层 / 低层亮度通路，用来判断"读不到亮度"到底卡在哪一层。
+ * ------------------------------------------------------------------------- */
+static void RunProbe(void)
+{
+    CollectMonitors();
+
+    std::lock_guard<std::mutex> lk(g_monMtx);
+
+    printf("\n=== DDC/CI 诊断 ===\n\n");
+
+    size_t total = 0;
+    for (size_t i = 0; i < g_physKeep.size(); ++i) total += g_physKeep[i].size();
+    printf("物理显示器句柄: %d 个\n\n", (int)total);
+
+    int idx = 0;
+    for (size_t i = 0; i < g_physKeep.size(); ++i) {
+        for (size_t k = 0; k < g_physKeep[i].size(); ++k) {
+            HANDLE h = g_physKeep[i][k].hPhysicalMonitor;
+            idx++;
+            printf("[%d] %ls\n", idx, g_physKeep[i][k].szPhysicalMonitorDescription);
+
+            /* A：第三个参数传 NULL */
+            DWORD capsA = 0;
+            SetLastError(0);
+            BOOL a = GetMonitorCapabilities(h, &capsA, NULL);
+            DWORD eA = GetLastError();
+            printf("  能力(A 传 NULL)  : %s  caps=0x%08lX  err=%lu %s\n",
+                   a ? "成功" : "失败", (unsigned long)capsA,
+                   (unsigned long)eA, ErrText(eA));
+
+            /* B：两个参数都传真实变量 */
+            DWORD capsB = 0, tempsB = 0;
+            SetLastError(0);
+            BOOL b = GetMonitorCapabilities(h, &capsB, &tempsB);
+            DWORD eB = GetLastError();
+            printf("  能力(B 传变量)   : %s  caps=0x%08lX  色温=0x%04lX  err=%lu %s\n",
+                   b ? "成功" : "失败", (unsigned long)capsB,
+                   (unsigned long)tempsB, (unsigned long)eB, ErrText(eB));
+
+            if (a != b || eA != eB)
+                printf("  >>> 两种写法结果不同 —— 传 NULL 确实改变了行为\n");
+            else
+                printf("  >>> 两种写法结果一致 —— 此处的失败与参数写法无关\n");
+
+            /* 高层亮度 */
+            DWORD lo = 0, cur = 0, hi = 0, err = 0;
+            if (DdcciGetBrightness(h, lo, cur, hi, err))
+                printf("  高层亮度         : 成功 raw=%lu  (%lu-%lu)\n",
+                       (unsigned long)cur, (unsigned long)lo, (unsigned long)hi);
+            else
+                printf("  高层亮度         : 失败 err=%lu %s\n",
+                       (unsigned long)err, ErrText(err));
+
+            /* 低层 VCP 0x10 */
+            DWORD c2 = 0, m2 = 0, e2 = 0;
+            if (VcpGet(h, VCP_BRIGHTNESS, c2, m2, e2))
+                printf("  低层 VCP 0x10    : 成功 raw=%lu  (max=%lu)\n",
+                       (unsigned long)c2, (unsigned long)m2);
+            else
+                printf("  低层 VCP 0x10    : 失败 err=%lu %s\n",
+                       (unsigned long)e2, ErrText(e2));
+            printf("\n");
+        }
+    }
+
+    if (total == 0) printf("（没有枚举到任何物理显示器句柄）\n\n");
+
+    /* WMI 通道概要 */
+    int wmi = 0;
+    for (size_t i = 0; i < g_mons.size(); ++i) {
+        if (!g_mons[i].isWmi) continue;
+        wmi++;
+        printf("[WMI] %s  当前 %d%%  %s\n",
+               g_mons[i].desc.c_str(), g_mons[i].percent,
+               g_mons[i].ok ? "可用" : ("不可用: " + g_mons[i].error).c_str());
+    }
+    if (wmi == 0) printf("（没有 WMI 通道）\n");
 }
 
 static void DoVcp(BYTE code, DWORD value)
@@ -1172,6 +1274,7 @@ static void PrintUsage(void)
         "  brightnessctl set <0-100>    设置所有显示器亮度\n"
         "  brightnessctl max / min      调到最高 / 最低\n"
         "  brightnessctl vcp <c> <v>    写任意 VCP（如 vcp 0x10 100）\n"
+        "  brightnessctl probe          诊断：逐条试 DDC/CI 各层通路并打印错误码\n"
         "\n启动日志（排查用）: %%TEMP%%\\brightnessctl.log\n");
 }
 
@@ -1221,6 +1324,10 @@ int main(int argc, char **argv)
     if (!strcmp(cmd, "vcp")) {
         if (argc < 4) { printf("用法: brightnessctl vcp <code> <value>\n"); return 2; }
         DoVcp((BYTE)strtol(argv[2], NULL, 0), (DWORD)strtoul(argv[3], NULL, 0));
+        return 0;
+    }
+    if (!strcmp(cmd, "probe") || !strcmp(cmd, "diag")) {
+        RunProbe();
         return 0;
     }
 
