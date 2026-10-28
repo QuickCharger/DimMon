@@ -1,6 +1,6 @@
 # DimMon — brightnessctl
 
-Windows 显示器亮度控制工具：一个**零依赖的单文件 exe**（约 350 KB），不装运行时、不写注册表、不留后台服务。
+Windows 显示器亮度控制工具：一个**运行时零依赖的单文件 exe**（约 480 KB），不装运行时、不写注册表、不留后台服务。
 
 两种用法：
 
@@ -18,6 +18,7 @@ Windows 显示器亮度控制工具：一个**零依赖的单文件 exe**（约 
 - **抗抖动**：DDC 总线的 5 类瞬时错误自动重试一次。
 - **写后回读校验**：`SetMonitorBrightness` 失败时也可能返回 TRUE，所以每次写完强制读回确认。
 - **本地 Web UI**：纯 Winsock2 手写的最小 HTTP/1.1 服务，只绑 `127.0.0.1`，端口随机。
+- **作息曲线**：网页里画一条 24 小时曲线，后台按时间插值自动调亮度（手动调过之后 30 分钟内不干预）。
 - **体验细节**：双击自动隐藏黑框；浏览器起不来就把网址塞进剪贴板并弹窗；UI 页面开发期读 `ui\index.html`，发布时以 RCDATA 内嵌进 exe。
 
 ---
@@ -34,7 +35,7 @@ cmake -S . -B build -G "MinGW Makefiles"
 cmake --build build
 ```
 
-产物：`build\brightnessctl.exe`（约 350 KB，静态链接的自包含单文件）。
+产物：`build\brightnessctl.exe`（约 480 KB，静态链接的自包含单文件）。
 
 > 第一行不是可选的装饰 —— **MinGW 的 `bin` 必须在 PATH 里**。
 > `cc1.exe` / `cc1plus.exe` 位于 `libexec\gcc\...\`，但它们依赖的 `libwinpthread-1.dll` 只在 `bin\` 下；
@@ -57,8 +58,30 @@ cmake -S . -B build -G "MinGW Makefiles" -DMINGW_BIN=D:\git\tools\Qt\Qt6.8.3\Too
 
 ### 依赖什么
 
-- **CMake** ≥ 3.16（本机为 4.1.0，位于 `C:\Program Files\CMake\bin`）
+**构建工具**
+
+- **CMake** ≥ 3.16（本机用的是 Qt 自带的 3.30.5：`C:\Qt\Qt6.8.3\Tools\CMake_64\bin\cmake.exe`）
 - **MinGW-w64** 工具链：`g++`、`windres`、`mingw32-make`（都在 Qt 的 `mingw1310_64\bin` 里）
+
+**第三方代码**
+
+- [nlohmann/json](https://github.com/nlohmann/json) v3.12.0（MIT，header-only）—— 只用于 JSON 序列化。
+
+它**不在本仓库里**：CMake 的 `FetchContent` 在 configure 阶段把它下载到 `build/_deps/`，
+而 `build/` 已被 `.gitignore` 忽略，所以仓库里只有 CMakeLists 那几行声明
+（地址 + 版本 + SHA256 校验值），没有任何第三方源码。首次 configure 需要联网。
+
+> 国内直连 `github.com` 实测超时（curl 返回 000），默认走 `ghfast.top` 镜像。
+> 如果你那边能直连，覆盖地址即可：
+>
+> ```bat
+> cmake -S . -B build -G "MinGW Makefiles" ^
+>       -DNLOHMANN_URL=https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz
+> ```
+>
+> 想完全离线构建：把单头文件 `json.hpp` 放到 `third_party/nlohmann/` 下，
+> `CMakeLists.txt` 会自动改用它，跳过一切下载（放好后要重新跑一次
+> `cmake -S . -B build`，因为那个判断发生在 configure 阶段）。
 
 ### 获取 MinGW
 
@@ -110,6 +133,52 @@ https://download.qt.io/online/qtsdkrepository/windows_x86/desktop/tools_mingw131
 
 ---
 
+## 作息曲线（自动调节）
+
+网页里那条 24 小时曲线就是配置界面：
+
+- **拖圆点**调亮度，**空白处单击**新增点，**右键或双击**删除点；时间吸附到 15 分钟一档。
+- 左边竖着的滑轨是**整体缩放**：设成 80% 就是曲线上所有值都降到 80%，不改变曲线形状。
+- 0 点与 24 点是**同一时刻**（跨午夜），改一端另一端自动跟随，不会在半夜跳亮度。
+
+配置存在 `schedule.json`，结构很直白：
+
+```json
+{
+  "enabled": true,
+  "scale": 65,
+  "points": [
+    { "x": 0,    "y": 25 },
+    { "x": 7.25, "y": 70 },
+    { "x": 24,   "y": 25 }
+  ]
+}
+```
+
+`x` 是小时（0–24），`y` 是曲线上的原始亮度；实际写进显示器的值 = 线性插值结果 × `scale / 100`。
+这个文件可以手改，改完重启程序即可生效（`target`、`holdMin` 是运行态字段，不写进文件）。
+
+后台线程每 30 秒检查一次，靠下面几条规则避免把亮度调成"一格一格跳"：
+
+| 规则 | 值 | 为什么 |
+|---|---|---|
+| 死区 | 2% | 曲线是连续插值的，每隔 30 秒几乎每次都在变；1% 也写的话一天要写几百次 |
+| 最小间隔 | 60 秒 | 防止目标值在死区边界抖动时反复写 |
+| 手动优先 | 30 分钟 | 你手动调过亮度后，自动调节 30 分钟内不干预 |
+| 失败退避 | 60→120→240→480→900 秒 | 显示器休眠/关掉时一个都写不进去，指数退避而不是每 30 秒白试 |
+
+接口（都要带 `X-Token` 请求头）：
+
+| 接口 | 说明 |
+|---|---|
+| `GET /api/schedule` | 读配置（`enabled` / `scale` / `points`） |
+| `POST /api/schedule` | 写配置并落盘，格式不合法返回 400 |
+| `GET /api/state` | 显示器列表 + `schedule` 运行态（多 `target` 当前目标值、`holdMin` 手动优先剩余分钟） |
+
+命令行 `brightnessctl schedule` 只读查看当前配置和此刻的目标亮度。
+
+---
+
 ## 运行机制
 
 | 项 | 位置 / 名称 |
@@ -119,6 +188,7 @@ https://download.qt.io/online/qtsdkrepository/windows_x86/desktop/tools_mingw131
 | 退出信号 | `Local\brightnessctl_ui_stop` |
 | 端口记录文件 | `%TEMP%\brightnessctl_ui.port`（只记端口，不含 token） |
 | 日志 | `%TEMP%\brightnessctl.log` |
+| 作息曲线配置 | exe 同目录 `schedule.json`（便携优先）；该目录不可写时回退 `%APPDATA%\brightnessctl\schedule.json` |
 
 后台模式只允许一个实例；第二个进程发信号后即退出。日志文件默认追加，只有确认自己是唯一的常驻实例时才清空重开。
 
@@ -134,7 +204,10 @@ https://download.qt.io/online/qtsdkrepository/windows_x86/desktop/tools_mingw131
 | `brightnessctl.rc` | 资源脚本：版本信息、图标、内嵌 UI 页面 |
 | `brightnessctl.manifest` | DPI 感知与公共控件 v6 清单 |
 | `brightnessctl.ico` | 程序图标 |
-| `CMakeLists.txt` | 构建脚本：工具链选择、资源编译、静态链接与安全加固选项 |
+| `CMakeLists.txt` | 构建脚本：工具链选择、资源编译、第三方依赖获取（FetchContent）、静态链接与安全加固选项 |
+
+第三方代码（nlohmann/json）不在仓库里，由 CMake 下载到 `build\_deps\`；
+想离线构建时才需要自己放 `third_party\nlohmann\json.hpp`。
 
 ---
 

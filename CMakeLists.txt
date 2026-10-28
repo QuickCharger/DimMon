@@ -85,6 +85,52 @@ endif()
 # windres 要在源目录里找 manifest / ico / ui 页面
 set(CMAKE_RC_FLAGS "-I${CMAKE_CURRENT_SOURCE_DIR}")
 
+# ===========================================================================
+#  第三方库：nlohmann/json（JSON 序列化/反序列化）
+#  ---------------------------------------------------------------------------
+#  C++ 没有 npm/pip 那种中心化包管理，"用别人的库"常见的四种做法：
+#
+#   1) 把源码拷进项目（vendoring）—— 最土但最稳，缺点是 900KB 的别人的头文件
+#      躺在自己仓库里，diff/blame 全被污染。
+#   2) FetchContent —— 下面用的这个。仓库里只留几行"从哪下、什么版本、
+#      校验值多少"，configure 时自动下到 build/_deps/ 下，源码不进版本库。
+#   3) git submodule —— 仓库里只留一个 commit 号，但 clone 要加 --recursive，
+#      忘了就编译不过；国内网络下同样容易卡。
+#   4) vcpkg / Conan —— 大型项目的正规解法，但本项目卖点是"零运行时依赖、
+#      单文件 exe"，为一个大头文件拉一个包管理器进来不合算。
+#
+#  注意项：
+#   - 固定 URL + SHA256：下到的东西必须和作者发布的一致，防止被中间人替换。
+#   - 国内直连 github.com 实测超时（返回 000），默认走 ghfast.top 镜像。
+#     能直连就覆盖这个变量：
+#       cmake -S . -B build -G "MinGW Makefiles" -DNLOHMANN_URL=<官方地址>
+#   - 想完全离线构建：把单头文件 json.hpp 放到 third_party/nlohmann/ 下，
+#     下面的 if 会自动改用它，跳过一切下载。
+# ===========================================================================
+set(NLOHMANN_TAG "v3.12.0")
+set(NLOHMANN_URL
+    "https://ghfast.top/https://github.com/nlohmann/json/releases/download/${NLOHMANN_TAG}/json.tar.xz"
+    CACHE STRING "nlohmann/json 下载地址（可换成官方 GitHub 地址或 file:/// 本地包）")
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann/json.hpp")
+    message(STATUS "nlohmann/json: 使用本地副本 third_party/nlohmann/json.hpp（不下载）")
+    add_library(nlohmann_json INTERFACE)
+    target_include_directories(nlohmann_json INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
+    add_library(nlohmann_json::nlohmann_json ALIAS nlohmann_json)
+else()
+    include(FetchContent)
+    if(POLICY CMP0135)
+        cmake_policy(SET CMP0135 NEW)   # 解压出来的文件用当前时间戳，避免每次都重编
+    endif()
+    set(JSON_BuildTests OFF CACHE INTERNAL "")   # 只要头文件，不要它的单元测试
+    set(JSON_Install    OFF CACHE INTERNAL "")
+    FetchContent_Declare(nlohmann_json
+        URL "${NLOHMANN_URL}"
+        URL_HASH SHA256=42f6e95cad6ec532fd372391373363b62a14af6d771056dbfc86160e6dfff7aa
+    )
+    FetchContent_MakeAvailable(nlohmann_json)
+endif()
+
 # ---- 目标 ----
 add_executable(brightnessctl
     brightnessctl.cpp
@@ -124,6 +170,7 @@ target_link_options(brightnessctl PRIVATE
 )
 
 target_link_libraries(brightnessctl PRIVATE
+    nlohmann_json::nlohmann_json   # 头文件库，只提供 include 路径
     dxva2        # DDC/CI：GetMonitorBrightness / GetVCPFeatureAndVCPFeatureReply
     wbemuuid     # WMI：WmiSetBrightness
     ole32

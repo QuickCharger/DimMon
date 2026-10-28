@@ -15,12 +15,14 @@
  *    brightnessctl.exe max / min     调到最高 / 最低
  *    brightnessctl.exe vcp <c> <v>   写任意 VCP（如 vcp 0x10 100）
  *
- *  构建 (MinGW, 零额外下载):
- *    windres brightnessctl.rc -O coff -o brightnessctl_res.o
- *    g++ -O2 -s -static -o brightnessctl.exe brightnessctl.cpp httpd.cpp \
- *        brightnessctl_res.o \
- *        -ldxva2 -luser32 -lshell32 -ladvapi32 -lws2_32 \
- *        -lwbemuuid -lole32 -loleaut32 -luuid
+ *  构建（cmake + MinGW，不需要 MSVC / Windows SDK）:
+ *    cmake -S . -B build -G "MinGW Makefiles"
+ *    cmake --build build
+ *
+ *  依赖: nlohmann/json（header-only，MIT）用于 JSON 序列化。
+ *       由 CMake 的 FetchContent 在 configure 阶段下载到 build/_deps/，
+ *       源码不进本仓库；国内默认走 ghfast.top 镜像（直连 GitHub 实测超时）。
+ *       想完全离线构建：把 json.hpp 放到 third_party/nlohmann/ 下即可跳过下载。
  * =========================================================================== */
 
 #define _WIN32_WINNT 0x0601
@@ -45,6 +47,18 @@
 #include <utility>
 #include <mutex>
 #include <thread>
+#include <algorithm>
+#include <cmath>
+
+/* JSON：nlohmann/json（header-only，由 CMake FetchContent 拉取，见 CMakeLists.txt）
+ *
+ * 用 ordered_json 而不是 json：
+ *   普通 json 的底层是 std::map，dump 出来的键按字母排序（enabled, holdMin,
+ *   points, scale, target），落盘的 schedule.json 看起来莫名其妙；
+ *   ordered_json 保留插入顺序，就是代码里写的 enabled/scale/points，
+ *   人打开配置文件一眼能看懂。 */
+#include <nlohmann/json.hpp>
+using json = nlohmann::ordered_json;
 
 #include <wincrypt.h>
 
@@ -597,85 +611,88 @@ static void SetMonPercent(int id, int percent)
 }
 
 /* ---------------------------------------------------------------------------
- * JSON 输出
+ * JSON（nlohmann/json）
+ *  ---------------------------------------------------------------------------
+ *  以前这里是手写字符串拼接 + find("\"key\"") 取值。能跑，但很难读也很难改：
+ *    - 同一个 key 出现在别的嵌套层会误匹配（纯字符串查找，没有层级概念）
+ *    - 数组里再嵌对象就解错（靠 find('{')/find('}') 配对，遇到嵌套直接崩）
+ *    - 每个字段都要单独写一个 JsonXxxField，加字段就得抄一遍逻辑
+ *  换成 nlohmann/json 之后是声明式写法，嵌套多深都不用管。
  * ------------------------------------------------------------------------- */
-static std::string JsonEsc(const std::string &s)
+static unsigned short g_port = 0;
+
+/* dump 的统一出口。
+ * 显示器名来自 EDID / 系统接口，偶尔带非法 UTF-8 字节，而 dump() 默认
+ * 遇到非法序列会抛 type_error.316 —— 这里换成 U+FFFD 替换字符。 */
+static std::string DumpJson(const json &j, int indent = -1)
 {
-    std::string o;
-    o.reserve(s.size() + 8);
-    for (size_t i = 0; i < s.size(); ++i) {
-        unsigned char c = (unsigned char)s[i];
-        switch (c) {
-        case '"':  o += "\\\""; break;
-        case '\\': o += "\\\\"; break;
-        case '\b': o += "\\b";  break;
-        case '\f': o += "\\f";  break;
-        case '\n': o += "\\n";  break;
-        case '\r': o += "\\r";  break;
-        case '\t': o += "\\t";  break;
-        default:
-            if (c < 0x20) {
-                char b[8];
-                snprintf(b, sizeof(b), "\\u%04x", c);
-                o += b;
-            } else {
-                o += (char)c;
-            }
-        }
-    }
-    return o;
+    return j.dump(indent, ' ', false, json::error_handler_t::replace);
 }
 
-static unsigned short g_port = 0;
+/* 解析文本。allow_exceptions=false：失败返回 discarded 值，不抛异常。 */
+static bool ParseJson(const std::string &txt, json &out)
+{
+    out = json::parse(txt, nullptr, false);
+    return !out.is_discarded();
+}
+
+/* 取字段：不存在或类型不对就返回默认值（不抛异常） */
+static double JsonNum(const json &j, const char *key, double def)
+{
+    auto it = j.find(key);
+    if (it == j.end() || !it->is_number()) return def;
+    return it->get<double>();
+}
+
+static int JsonInt(const json &j, const char *key, int def)
+{
+    auto it = j.find(key);
+    if (it == j.end() || !it->is_number()) return def;
+    return (int)it->get<double>();
+}
+
+static bool JsonBool(const json &j, const char *key, bool def)
+{
+    auto it = j.find(key);
+    if (it == j.end() || !it->is_boolean()) return def;
+    return it->get<bool>();
+}
+
+/* 定义在下方「作息曲线」一节，StateJson 需要先引用。
+ * withRuntime=true 时多带 target / holdMin 两个运行态字段（只给 /api/state 用，
+ * 不写进配置文件、也不出现在 GET /api/schedule 的响应里）。 */
+static json SchedStateJson(bool withRuntime = false);
 
 static std::string StateJson(void)
 {
-    std::lock_guard<std::mutex> lk(g_monMtx);
-    std::string j;
-    j += "{\"ok\":true,\"port\":";
-    j += std::to_string((int)g_port);
-    j += ",\"count\":";
-    j += std::to_string((int)g_mons.size());
-    j += ",\"monitors\":[";
-    for (size_t i = 0; i < g_mons.size(); ++i) {
-        const MonInfo &m = g_mons[i];
-        if (i) j += ",";
-        j += "{\"id\":";        j += std::to_string(m.id);
-        j += ",\"device\":\"";  j += JsonEsc(m.device);
-        j += "\",\"desc\":\"";  j += JsonEsc(m.desc);
-        j += "\",\"method\":\""; j += JsonEsc(m.method);
-        j += "\",\"percent\":"; j += std::to_string(m.percent);
-        j += ",\"min\":";       j += std::to_string((int)m.lo);
-        j += ",\"max\":";       j += std::to_string((int)m.hi);
-        j += ",\"primary\":";   j += (m.primary ? "true" : "false");
-        j += ",\"ok\":";        j += (m.ok ? "true" : "false");
-        j += ",\"error\":\"";   j += JsonEsc(m.error);
-        j += "\"}";
-    }
-    j += "]}";
-    return j;
-}
+    json j;
 
-/* 极简 JSON 取整数字段 */
-static int JsonIntField(const std::string &s, const char *key, int def)
-{
-    std::string k = std::string("\"") + key + "\"";
-    size_t p = s.find(k);
-    if (p == std::string::npos) return def;
-    p = s.find(':', p + k.size());
-    if (p == std::string::npos) return def;
-    ++p;
-    while (p < s.size() && (s[p] == ' ' || s[p] == '\t')) ++p;
-    bool neg = false;
-    if (p < s.size() && (s[p] == '-' || s[p] == '+')) { neg = (s[p] == '-'); ++p; }
-    if (p >= s.size() || s[p] < '0' || s[p] > '9') return def;
-    long v = 0;
-    while (p < s.size() && s[p] >= '0' && s[p] <= '9') {
-        v = v * 10 + (s[p] - '0');
-        ++p;
-        if (v > 1000000) break;
+    {
+        std::lock_guard<std::mutex> lk(g_monMtx);
+        json arr = json::array();
+        for (const MonInfo &m : g_mons) {
+            json o = json::object();
+            o["id"]      = m.id;
+            o["device"]  = m.device;
+            o["desc"]    = m.desc;
+            o["method"]  = m.method;
+            o["percent"] = m.percent;
+            o["min"]     = (int)m.lo;
+            o["max"]     = (int)m.hi;
+            o["primary"] = m.primary;
+            o["ok"]      = m.ok;
+            o["error"]   = m.error;
+            arr.push_back(std::move(o));
+        }
+        j["ok"]       = true;
+        j["port"]     = (int)g_port;
+        j["count"]    = (int)arr.size();
+        j["monitors"] = std::move(arr);
     }
-    return (int)(neg ? -v : v);
+
+    /* 作息曲线状态（内部用另一把锁；两把锁从不同时持有，不会死锁） */
+    j["schedule"] = SchedStateJson(true);
+    return DumpJson(j);
 }
 
 /* ---------------------------------------------------------------------------
@@ -695,6 +712,337 @@ static bool ReadWholeFileW(const std::wstring &path, std::string &out)
     if (!ok) return false;
     out.resize(rd);
     return true;
+}
+
+/* ---------------------------------------------------------------------------
+ *  作息曲线（按 24 小时时间表自动调节亮度）
+ *  ---------------------------------------------------------------------------
+ *  数据：enabled / scale(10-100) / points[{x:0-24小时, y:0-100亮度}]
+ *  求值：点之间线性插值 × scale/100，范围外取端点值（与前端完全一致）
+ *  配置：exe 同目录 schedule.json（便携优先），不可写时回退 %APPDATA%
+ * ------------------------------------------------------------------------- */
+static void Logf(const char *fmt, ...);   /* 前向声明：定义在下方日志一节 */
+
+struct SchPoint { double x; int y; };
+
+static std::mutex            g_schMtx;
+static bool                  g_schEnabled = false;
+static int                   g_schScale   = 100;
+static std::vector<SchPoint> g_schPoints;
+static time_t                g_manualUntil = 0;    /* 手动操作后的免打扰截止时刻 */
+static int                   g_lastApplied = -1;   /* 上次自动写入的值，用于去重 */
+static time_t                g_lastWriteAt = 0;    /* 上次真正写入的时刻，用于最小间隔 */
+static int                   g_failStreak  = 0;    /* 连续写入失败次数，用作退避指数 */
+static long                  g_nextGap     = 60;   /* 下次写入与上次的最小间隔（秒） */
+
+/* ---------- 路径 ---------- */
+static std::wstring ExeDirW(void)
+{
+    wchar_t exe[MAX_PATH];
+    DWORD n = GetModuleFileNameW(NULL, exe, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return L".\\";
+    std::wstring p(exe, n);
+    size_t pos = p.find_last_of(L"\\/");
+    return (pos == std::wstring::npos) ? L".\\" : p.substr(0, pos + 1);
+}
+
+/* 探测目录是否可写：建一个临时文件立刻删掉，不在用户目录留 0 字节垃圾 */
+static bool DirWritableW(const std::wstring &dir)
+{
+    wchar_t tmp[MAX_PATH];
+    if (!GetTempFileNameW(dir.c_str(), L"bctl", 0, tmp)) return false;
+    DeleteFileW(tmp);
+    return true;
+}
+
+/* 便携优先：exe 同目录；不可写（如装在 Program Files）时回退 %APPDATA% */
+static std::wstring SchedPathW(void)
+{
+    std::wstring dir = ExeDirW();
+    if (DirWritableW(dir)) return dir + L"schedule.json";
+
+    wchar_t app[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(L"APPDATA", app, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) {
+        std::wstring d = std::wstring(app, n) + L"\\brightnessctl";
+        CreateDirectoryW(d.c_str(), NULL);
+        return d + L"\\schedule.json";
+    }
+    return dir + L"schedule.json";
+}
+
+/* ---------- 默认曲线（与网页端「护眼」预设一致） ---------- */
+static void SchedSetDefault(void)
+{
+    std::lock_guard<std::mutex> lk(g_schMtx);
+    g_schEnabled = false;
+    g_schScale   = 100;
+    g_schPoints.clear();
+    const double xs[] = { 0,  6,  8, 12, 17, 20, 22, 24 };
+    const int    ys[] = { 20, 20, 55, 75, 60, 35, 25, 20 };
+    for (int i = 0; i < 8; ++i) {
+        SchPoint p; p.x = xs[i]; p.y = ys[i];
+        g_schPoints.push_back(p);
+    }
+}
+
+/* ---------- 序列化 / 反序列化 ---------- */
+/* 下面要输出 target / holdMin，用到的求值函数定义在后面的「求值」一节 */
+static double NowHours(void);
+static int    SchedValueAtLocked(double h);
+static int    SchedHoldMinutesLocked(void);
+
+/*
+ * 同一份对象既用于 GET /api/schedule（配置），也嵌进 /api/state 的 schedule
+ * 字段。后者比前者多 target / holdMin 两个运行态字段 —— 多给前端两个只读
+ * 字段无害，所以不做两套，省掉一个分支。
+ */
+static json SchedStateJson(bool withRuntime)
+{
+    std::lock_guard<std::mutex> lk(g_schMtx);
+
+    json j = json::object();
+    j["enabled"] = g_schEnabled;
+    j["scale"]   = g_schScale;
+
+    json pts = json::array();
+    for (const SchPoint &p : g_schPoints) {
+        json q = json::object();
+        double rx = std::round(p.x * 100.0) / 100.0;    /* 保留两位小数 */
+        if (rx == std::floor(rx)) q["x"] = (int)rx;     /* 整点写成 0 / 7，不写 0.0 */
+        else                      q["x"] = rx;
+        q["y"] = p.y;
+        pts.push_back(std::move(q));
+    }
+    j["points"] = std::move(pts);
+
+    if (withRuntime) {
+        /* 运行态字段，只给 /api/state 用，不写进配置文件。
+           此处已持有 g_schMtx，必须用无锁版本，否则 std::mutex 不可重入会死锁 */
+        j["target"]  = SchedValueAtLocked(NowHours());
+        j["holdMin"] = SchedHoldMinutesLocked();
+    }
+    return j;
+}
+
+static std::string SchedToJson(void)
+{
+    return DumpJson(SchedStateJson());
+}
+
+static bool SchedFromJson(const json &j)
+{
+    if (!j.is_object()) return false;
+
+    auto pit = j.find("points");
+    if (pit == j.end() || !pit->is_array()) return false;
+
+    std::vector<SchPoint> pts;
+    for (const json &e : *pit) {
+        if (!e.is_object()) continue;
+        double x = JsonNum(e, "x", -1);
+        double y = JsonNum(e, "y", -1);
+        if (x < 0 || x > 24 || y < 0 || y > 100) continue;   /* 越界的点直接丢掉 */
+        pts.push_back(SchPoint{ x, (int)(y + 0.5) });
+    }
+    if (pts.size() < 2) return false;                        /* 至少两点才成曲线 */
+
+    std::sort(pts.begin(), pts.end(),
+              [](const SchPoint &a, const SchPoint &b) { return a.x < b.x; });
+
+    /* 0 点与 24 点是同一时刻：两端同时存在时强制同值，避免跨午夜跳变 */
+    if (pts.front().x == 0 && pts.back().x == 24)
+        pts.back().y = pts.front().y;
+
+    int scale = JsonInt(j, "scale", 100);
+    scale = scale < 10 ? 10 : (scale > 100 ? 100 : scale);
+
+    std::lock_guard<std::mutex> lk(g_schMtx);
+    g_schEnabled  = JsonBool(j, "enabled", false);
+    g_schScale    = scale;
+    g_schPoints   = pts;
+    g_lastApplied = -1;      /* 配置变了，下一次强制重新应用 */
+    return true;
+}
+
+/* ---------- 文件读写 ---------- */
+static void SchedLoad(void)
+{
+    std::wstring path = SchedPathW();
+    std::string  txt;
+    if (!ReadWholeFileW(path, txt) || txt.empty()) {
+        Logf("作息曲线: 无配置文件，使用默认 (%ls)", path.c_str());
+        SchedSetDefault();
+        return;
+    }
+    json j;
+    if (ParseJson(txt, j) && SchedFromJson(j))
+        Logf("作息曲线: 已加载 %ls", path.c_str());
+    else {
+        Logf("作息曲线: 配置解析失败，回退默认");
+        SchedSetDefault();
+    }
+}
+
+static bool SchedSave(void)
+{
+    /* 缩进 2 空格：这是给人看、甚至手改的文件，不是网络传输的报文 */
+    std::string  txt  = DumpJson(SchedStateJson(), 2);
+    std::wstring path = SchedPathW();
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) {
+        Logf("作息曲线: 保存失败 %ls (err=%lu)",
+             path.c_str(), (unsigned long)GetLastError());
+        return false;
+    }
+    DWORD wr = 0;
+    WriteFile(f, txt.data(), (DWORD)txt.size(), &wr, NULL);
+    CloseHandle(f);
+    Logf("作息曲线: 已保存 %ls (%lu 字节)", path.c_str(), (unsigned long)wr);
+    return wr == txt.size();
+}
+
+/* ---------- 求值 ---------- */
+static double NowHours(void)
+{
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    return st.wHour + st.wMinute / 60.0 + st.wSecond / 3600.0;
+}
+
+/* 无锁版本：调用者必须已持有 g_schMtx */
+static int SchedValueAtLocked(double h)
+{
+    if (g_schPoints.empty()) return 100;
+    const std::vector<SchPoint> &p = g_schPoints;
+
+    double raw;
+    if (h <= p.front().x)      raw = p.front().y;
+    else if (h >= p.back().x)  raw = p.back().y;
+    else {
+        raw = p.front().y;
+        for (size_t i = 0; i + 1 < p.size(); ++i) {
+            if (h >= p[i].x && h <= p[i+1].x) {
+                double span = p[i+1].x - p[i].x;
+                double t = (span > 0) ? (h - p[i].x) / span : 0.0;
+                raw = p[i].y + t * (double)(p[i+1].y - p[i].y);
+                break;
+            }
+        }
+    }
+    double v = raw * g_schScale / 100.0;
+    if (v < 0)   v = 0;
+    if (v > 100) v = 100;
+    return (int)(v + 0.5);
+}
+
+/* 加锁版：外部调用用这个 */
+static int SchedValueAt(double h)
+{
+    std::lock_guard<std::mutex> lk(g_schMtx);
+    return SchedValueAtLocked(h);
+}
+
+/* 用户手动改过亮度后，自动调节退避一段时间 */
+static void SchedNoteManual(int minutes)
+{
+    std::lock_guard<std::mutex> lk(g_schMtx);
+    g_manualUntil = time(NULL) + (time_t)minutes * 60;
+    Logf("作息曲线: 检测到手动操作，自动调节退避 %d 分钟", minutes);
+}
+
+/* 无锁版本：调用者必须已持有 g_schMtx */
+static int SchedHoldMinutesLocked(void)
+{
+    time_t left = g_manualUntil - time(NULL);
+    if (left <= 0) return 0;
+    return (int)((left + 59) / 60);
+}
+
+/* 手动退避剩余分钟（0 = 未退避） */
+static int SchedHoldMinutes(void)
+{
+    std::lock_guard<std::mutex> lk(g_schMtx);
+    return SchedHoldMinutesLocked();
+}
+
+/* ---------- 自动调节线程（仅常驻 UI 模式启动） ---------- */
+/*
+ * 两个节流参数的理由（不加会很难用）：
+ *   死区 2% —— 曲线是连续插值的，每 30 秒算一次几乎每次都在变；1% 也写的话
+ *              亮度一天会被写几百次，肉眼能看见一格一格跳，DDC/CI 也白白损耗。
+ *              差不到 2% 就不动，一天实际写入次数降到几十次。
+ *   最小间隔 60 秒 —— 防止目标值在死区边界上抖动时反复写。
+ */
+#define SCH_DEADBAND 2
+#define SCH_MIN_GAP  60
+
+static void SchedThread(void)
+{
+    Logf("作息曲线: 自动调节线程已启动（每 30 秒检查，变化不足 %d%% 不写）",
+         SCH_DEADBAND);
+    for (;;) {
+        Sleep(30000);
+
+        {
+            std::lock_guard<std::mutex> lk(g_schMtx);
+            if (!g_schEnabled) continue;              /* 没启用 */
+            if (time(NULL) < g_manualUntil) continue; /* 手动优先期内不干预 */
+        }
+
+        int    want = SchedValueAt(NowHours());
+        int    last;
+        time_t lastAt;
+        long   gap;
+        {
+            std::lock_guard<std::mutex> lk(g_schMtx);
+            last   = g_lastApplied;
+            lastAt = g_lastWriteAt;
+            gap    = g_nextGap;
+        }
+        /* 最小间隔对首次写入之外的所有情况都生效（含失败重试） */
+        if (lastAt && time(NULL) - lastAt < gap) continue;   /* 写得太勤 */
+        if (last >= 0) {                              /* -1 = 还没写过，首次必写 */
+            int diff = want - last;
+            if (diff < 0) diff = -diff;
+            if (diff < SCH_DEADBAND) continue;        /* 变化太小 */
+        }
+
+        /* 每次写之前重新枚举：后台可能已经跑了几小时，
+           休眠唤醒 / 拔插显示器之后，启动时那份快照未必还有效 */
+        CollectMonitors();
+        SetMonPercent(-1, want);                      /* 内部只写 ok 的通道 */
+
+        int ok = 0, all = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_monMtx);
+            for (size_t i = 0; i < g_mons.size(); ++i) {
+                if (g_mons[i].ok) ok++;
+                all++;
+            }
+        }
+        Logf("作息曲线: 自动调节 %d%% -> %d%%（成功 %d/%d）", last, want, ok, all);
+
+        {
+            std::lock_guard<std::mutex> lk(g_schMtx);
+            if (ok > 0) {
+                g_lastApplied = want;            /* 写成功了，记住这次的值 */
+                g_failStreak  = 0;
+                g_nextGap     = SCH_MIN_GAP;
+            } else {
+                /* 一个都没写进去（显示器休眠 / 外接屏关了 / 通道临时失效）：
+                   指数退避，别每 30 秒白试一次把日志刷满 */
+                g_failStreak++;
+                long g = (long)SCH_MIN_GAP * (1L << (g_failStreak > 4 ? 4 : g_failStreak));
+                if (g > 900) g = 900;            /* 最长 15 分钟 */
+                g_nextGap = g;
+                Logf("作息曲线: 写入全部失败，%ld 秒后重试（连续失败 %d 次）",
+                     g, g_failStreak);
+            }
+            g_lastWriteAt = time(NULL);
+        }
+    }
 }
 
 static bool LoadUiHtml(std::string &out)
@@ -807,12 +1155,39 @@ static HttpResponse Route(const HttpRequest &req)
 
     if (req.path == "/api/set") {
         if (req.method != "POST") { r.SetText(405, "method not allowed"); return r; }
-        int id  = JsonIntField(req.body, "id", -1);
-        int pct = JsonIntField(req.body, "percent", -1);
+        json body;
+        if (!ParseJson(req.body, body) || !body.is_object()) {
+            r.SetText(400, "bad request body");
+            return r;
+        }
+        int id  = JsonInt(body, "id", -1);
+        int pct = JsonInt(body, "percent", -1);
         if (pct < 0 || pct > 100) { r.SetText(400, "percent out of range"); return r; }
         SetMonPercent(id, pct);
+        SchedNoteManual(30);       /* 手动调过之后 30 分钟内不被自动覆盖 */
         r.SetJson(StateJson());
         return r;
+    }
+
+    if (req.path == "/api/schedule") {
+        if (req.method == "GET") {
+            r.SetJson(SchedToJson());
+            return r;
+        }
+        if (req.method == "POST") {
+            json body;
+            if (!ParseJson(req.body, body) || !SchedFromJson(body)) {
+                r.SetText(400, "bad schedule json");
+                return r;
+            }
+            bool ok = SchedSave();
+            json res = json::object();
+            res["ok"] = ok;
+            if (!ok) res["error"] = "save failed";
+            r.SetJson(DumpJson(res));
+            return r;
+        }
+        r.SetText(405, "method not allowed"); return r;
     }
 
     if (req.path == "/api/quit") {
@@ -1185,6 +1560,10 @@ static int RunUi(unsigned short wantPort, bool hideConsoleNow)
     HANDLE hOpen = CreateEventW(NULL, TRUE, FALSE, BRIGHTNESSCTL_OPEN_EVENT);
     if (hOpen) ResetEvent(hOpen);
 
+    /* 作息曲线：加载配置并启动自动调节线程（只有常驻模式才需要） */
+    SchedLoad();
+    std::thread(SchedThread).detach();
+
     CollectMonitors();
     {
         std::lock_guard<std::mutex> lk(g_monMtx);
@@ -1261,6 +1640,37 @@ static int StopRunning(void)
 /* ---------------------------------------------------------------------------
  * main
  * ------------------------------------------------------------------------- */
+/* 命令行查看作息曲线配置（只读） */
+static int ShowSchedule(void)
+{
+    SchedLoad();
+    printf("配置文件: %s\n", W2U8(SchedPathW()).c_str());
+    int hold = SchedHoldMinutes();     /* 单独加锁取，避免和下面的锁重入 */
+    if (hold > 0)
+        printf("手动优先: 剩余 %d 分钟（此期间自动调节不干预）\n", hold);
+    {
+        std::lock_guard<std::mutex> lk(g_schMtx);
+        printf("自动调节: %s\n", g_schEnabled ? "已启用" : "未启用");
+        printf("整体缩放: %d%%\n", g_schScale);
+        printf("控制点  : %d 个\n", (int)g_schPoints.size());
+        {
+            /* 时刻显示成 23:09 这种，比 "23.15 时" 好读 */
+            double now = NowHours();
+            int    nH  = (int)now;
+            int    nM  = (int)((now - nH) * 60.0);
+            printf("此刻目标: %d%%   (%02d:%02d)\n",
+                   SchedValueAtLocked(now), nH, nM);
+        }
+        for (size_t i = 0; i < g_schPoints.size(); ++i) {
+            int hh = (int)g_schPoints[i].x;
+            int mm = (int)((g_schPoints[i].x - hh) * 60.0 + 0.5);
+            printf("   %02d:%02d  ->  %d%%\n", hh, mm, g_schPoints[i].y);
+        }
+    }
+    printf("\n修改方式: 直接运行 brightnessctl.exe 打开网页配置界面\n");
+    return 0;
+}
+
 static void PrintUsage(void)
 {
     printf(
@@ -1275,6 +1685,7 @@ static void PrintUsage(void)
         "  brightnessctl max / min      调到最高 / 最低\n"
         "  brightnessctl vcp <c> <v>    写任意 VCP（如 vcp 0x10 100）\n"
         "  brightnessctl probe          诊断：逐条试 DDC/CI 各层通路并打印错误码\n"
+        "  brightnessctl schedule       查看作息曲线配置与当前目标亮度（只读）\n"
         "\n启动日志（排查用）: %%TEMP%%\\brightnessctl.log\n");
 }
 
@@ -1329,6 +1740,9 @@ int main(int argc, char **argv)
     if (!strcmp(cmd, "probe") || !strcmp(cmd, "diag")) {
         RunProbe();
         return 0;
+    }
+    if (!strcmp(cmd, "schedule") || !strcmp(cmd, "sch")) {
+        return ShowSchedule();
     }
 
     PrintUsage();

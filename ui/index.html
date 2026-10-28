@@ -95,7 +95,7 @@
   .sw{margin-left:auto;display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer}
   .sw input{width:15px;height:15px;cursor:pointer}
   svg.sched{
-    width:100%;height:auto;display:block;user-select:none;
+    flex:1;min-width:0;width:100%;height:auto;display:block;user-select:none;
     touch-action:none;cursor:crosshair;
   }
   svg.sched .grid{stroke:var(--grid);stroke-width:1}
@@ -105,6 +105,8 @@
   svg.sched .dot{fill:var(--card);stroke:var(--accent);stroke-width:2;cursor:grab}
   svg.sched .dot:hover{stroke-width:3}
   svg.sched .dot.act{stroke-width:3}
+  svg.sched .guideline{fill:none;stroke:var(--accent);stroke-width:1;
+    stroke-dasharray:2 3;opacity:.45}
   svg.sched .nowline{stroke:var(--warn);stroke-width:1;stroke-dasharray:3 3}
   svg.sched .nowdot{fill:var(--warn);stroke:var(--card);stroke-width:2}
   svg.sched .nowlab{fill:var(--warn);font-size:10px;font-variant-numeric:tabular-nums}
@@ -112,6 +114,38 @@
   .sch-tip kbd{
     font:inherit;background:var(--bg);border:1px solid var(--line);
     border-radius:4px;padding:0 4px;font-size:11px;
+  }
+  /* 竖向的整体缩放滑轨，紧贴曲线图左侧，高度与图对齐 */
+  .sch-body{display:flex;gap:12px;align-items:stretch}
+  .vscale{
+    display:flex;flex-direction:column;align-items:center;gap:6px;
+    width:50px;flex:0 0 50px;
+  }
+  .vscale .val{
+    font-size:12px;font-weight:600;color:var(--accent);
+    font-variant-numeric:tabular-nums;line-height:1;
+  }
+  .vscale .lb{font-size:11px;color:var(--muted);line-height:1}
+  .vscale input[type=range].vertical{
+    -webkit-appearance:slider-vertical;   /* 旧版 Chrome/Edge */
+    appearance:slider-vertical;
+    writing-mode:vertical-lr;             /* 现代浏览器：靠 writing-mode 竖排 */
+    direction:rtl;                        /* 让最大值在顶部（向上拖 = 变亮） */
+    flex:1;width:20px;min-height:150px;margin:0;padding:0;background:transparent;
+  }
+  .vscale input[type=range].vertical::-webkit-slider-runnable-track{
+    width:6px;border-radius:3px;background:var(--line);
+  }
+  .vscale input[type=range].vertical::-webkit-slider-thumb{
+    -webkit-appearance:none;width:16px;height:16px;border-radius:50%;
+    background:var(--accent);border:2px solid var(--card);margin-left:-5px;cursor:pointer;
+  }
+  .vscale input[type=range].vertical::-moz-range-track{
+    width:6px;border-radius:3px;background:var(--line);
+  }
+  .vscale input[type=range].vertical::-moz-range-thumb{
+    width:14px;height:14px;border-radius:50%;background:var(--accent);
+    border:2px solid var(--card);cursor:pointer;
   }
   .note{
     margin-top:10px;padding:8px 10px;border-radius:8px;background:var(--accent-soft);
@@ -148,10 +182,19 @@
       </label>
     </div>
 
-    <svg class="sched" id="schSvg" viewBox="0 0 640 250" preserveAspectRatio="xMidYMid meet"></svg>
+    <div class="sch-body">
+      <div class="vscale">
+        <span class="val" id="schScaleVal">100%</span>
+        <input type="range" class="vertical" id="schScale" min="10" max="100" step="5" value="100"
+               oninput="onScale(this)" title="整体缩放：在原曲线基础上整体升降">
+        <span class="lb">缩放</span>
+      </div>
+      <svg class="sched" id="schSvg" viewBox="0 0 640 250" preserveAspectRatio="xMidYMid meet"></svg>
+    </div>
 
     <div class="sch-tip">
-      拖动圆点调整 · 空白处<kbd>点击</kbd>新增控制点 · <kbd>双击</kbd>圆点删除 · 每 15 分钟一档
+      拖动圆点调整 · 空白处<kbd>单击</kbd>新增 · <kbd>右键</kbd>或<kbd>双击</kbd>圆点删除 · 每 15 分钟一档<br>
+      0 点与 24 点是同一时刻（跨午夜），两端数值自动联动
     </div>
 
     <div class="toolbar" style="margin:12px 0 0">
@@ -179,6 +222,7 @@ var TOKEN = new URLSearchParams(location.search).get('token') || '';
 var dragging = false;
 var timers = {};
 var last = null;
+var lastHold = 0;   /* 后端回传的「手动优先」剩余分钟，0 = 自动调节正常工作中 */
 
 function toast(msg){
   var t = document.getElementById('toast');
@@ -198,7 +242,9 @@ function req(path, opt){
 
 function esc(s){
   return String(s).replace(/[&<>"']/g, function(c){
-    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+    var A = '\u0026';   // 用字符码拼实体，避免源码里的字面 & 被误转义
+    var m = {'&':A+'amp;', '<':A+'lt;', '>':A+'gt;', '"':A+'quot;', "'":A+'#39;'};
+    return m[c];
   });
 }
 
@@ -265,13 +311,17 @@ function setAll(p){
     method:'POST',
     headers:{'Content-Type':'application/json'},
     body: JSON.stringify({id:-1, percent:p})
-  }).then(function(d){ applyResult(d); toast('全部已设为 ' + p + '%'); })
+  }).then(function(d){
+    applyResult(d);
+    toast('全部已设为 ' + p + '%（30 分钟内自动调节不干预）');
+  })
     .catch(function(e){ toast('设置失败：' + e.message); });
 }
 
 function applyResult(d){
   if(!d || !d.monitors) return;
   last = d;
+  if(d.schedule) lastHold = d.schedule.holdMin || 0;
   d.monitors.forEach(function(m){
     var v = document.getElementById('v' + m.id);
     var card = document.querySelector('.card[data-id="' + m.id + '"]');
@@ -286,6 +336,7 @@ function applyResult(d){
 function load(verbose){
   req('/api/state').then(function(d){
     if(!dragging) render(d);
+    if(d && d.schedule) lastHold = d.schedule.holdMin || 0;
     document.getElementById('status').textContent =
       '已连接 · ' + new Date().toLocaleTimeString('zh-CN');
     if(verbose) toast('已刷新');
@@ -306,10 +357,12 @@ function quitApp(){
 /* ==========================================================================
  *  作息曲线（24 小时亮度曲线编辑器）
  * --------------------------------------------------------------------------
- *  数据：{enabled:bool, points:[{x:小时0-24, y:亮度0-100}]}
- *  曲线在点之间做线性插值；x<第一个点 或 x>最后一个点 时取端点值。
+ *  数据：{enabled, scale, points:[{x:小时0-24, y:亮度0-100}]}
+ *    · points 存的是"原始值"，scale 是整体缩放系数（100 = 不缩放）
+ *    · 实际亮度 = 线性插值结果 × scale/100
+ *    · 图上画缩放后的曲线，拖拽时反算回原始值，保证拖滑轨不破坏曲线形状
  * ======================================================================== */
-var SCH = {enabled:false, points:[]};
+var SCH = {enabled:false, scale:100, points:[]};
 var GEO = {L:40, R:12, T:14, B:28, W:588, H:196};   // viewBox 640x250
 var STEP = 0.25;                                     // 15 分钟一档
 var dragIdx = -1;
@@ -328,24 +381,44 @@ function invY(y){ return clamp((GEO.T + GEO.H - y) / GEO.H * 100, 0, 100); }
 function clamp(v,a,b){ return v < a ? a : (v > b ? b : v); }
 function snap(v, s){ return Math.round(v / s) * s; }
 
+/* 缩放系数，以及"原始值 → 图上 y 坐标" */
+function sF(){ return SCH.scale / 100; }
+function pys(p){ return py(clamp(p * sF(), 0, 100)); }
+
 function sorted(){
   return SCH.points.slice().sort(function(a,b){ return a.x - b.x; });
 }
 
-/* 求任意时刻的目标亮度（线性插值） */
+/* 0 点与 24 点是同一时刻（跨午夜）。两端控制点都存在时强制取同值，
+   否则 23:59 到 00:00 会出现亮度跳变。keep = 以哪个端点为准（sorted 索引）。 */
+function syncEnds(p, keep){
+  if(p.length < 2) return p;
+  if(p[0].x === 0 && p[p.length-1].x === 24){
+    if(keep === p.length - 1) p[0].y = p[p.length-1].y;
+    else                      p[p.length-1].y = p[0].y;
+  }
+  return p;
+}
+
+/* 求任意时刻的目标亮度（线性插值后套用整体缩放） */
 function valueAt(h){
   var p = sorted();
-  if(!p.length) return 100;
-  if(h <= p[0].x) return Math.round(p[0].y);
-  if(h >= p[p.length-1].x) return Math.round(p[p.length-1].y);
-  for(var i = 0; i < p.length - 1; i++){
-    if(h >= p[i].x && h <= p[i+1].x){
-      var span = p[i+1].x - p[i].x;
-      var t = span > 0 ? (h - p[i].x) / span : 0;
-      return Math.round(p[i].y + t * (p[i+1].y - p[i].y));
+  if(!p.length) return Math.round(100 * sF());
+  var raw;
+  if(h <= p[0].x) raw = p[0].y;
+  else if(h >= p[p.length-1].x) raw = p[p.length-1].y;
+  else{
+    raw = p[0].y;
+    for(var i = 0; i < p.length - 1; i++){
+      if(h >= p[i].x && h <= p[i+1].x){
+        var span = p[i+1].x - p[i].x;
+        var t = span > 0 ? (h - p[i].x) / span : 0;
+        raw = p[i].y + t * (p[i+1].y - p[i].y);
+        break;
+      }
     }
   }
-  return Math.round(p[0].y);
+  return Math.round(clamp(raw * sF(), 0, 100));
 }
 
 function hhmm(h){
@@ -382,11 +455,19 @@ function drawSch(){
          '" text-anchor="end">' + v + '</text>';
   }
 
-  /* 曲线 + 填充 */
+  /* 缩放生效时，用虚线画出原始曲线做参照 */
+  if(p.length && SCH.scale < 100){
+    var g = '';
+    for(var j = 0; j < p.length; j++)
+      g += (j ? 'L' : 'M') + px(p[j].x).toFixed(1) + ' ' + py(p[j].y).toFixed(1);
+    s += '<path class="guideline" d="' + g + '"/>';
+  }
+
+  /* 曲线 + 填充（缩放后） */
   if(p.length){
     var d = '', i;
     for(i = 0; i < p.length; i++)
-      d += (i ? 'L' : 'M') + px(p[i].x).toFixed(1) + ' ' + py(p[i].y).toFixed(1);
+      d += (i ? 'L' : 'M') + px(p[i].x).toFixed(1) + ' ' + pys(p[i].y).toFixed(1);
     var base = GEO.T + GEO.H;
     s += '<path class="area" d="' + d + 'L' + px(24).toFixed(1) + ' ' + base +
          'L' + px(0).toFixed(1) + ' ' + base + 'Z"/>';
@@ -402,15 +483,17 @@ function drawSch(){
        (GEO.T + 10) + '" text-anchor="' + (nh > 20 ? 'end' : 'start') + '">' +
        hhmm(nh) + '</text>';
 
-  /* 控制点 */
+  /* 控制点（画在缩放后的位置） */
   for(var k = 0; k < p.length; k++){
     s += '<circle class="dot' + (k === dragIdx ? ' act' : '') + '" data-i="' + k + '" cx="' +
-         px(p[k].x).toFixed(1) + '" cy="' + py(p[k].y).toFixed(1) + '" r="6"/>';
+         px(p[k].x).toFixed(1) + '" cy="' + pys(p[k].y).toFixed(1) + '" r="6"/>';
   }
 
   svgEl.innerHTML = s;
   document.getElementById('schNow').innerHTML =
-    '此刻 ' + hhmm(nh) + ' → <b>' + valueAt(nh) + '%</b>';
+    '此刻 ' + hhmm(nh) + ' → <b>' + valueAt(nh) + '%</b>' +
+    (lastHold > 0 ? ' · <span style="color:var(--warn)">手动优先 剩 '
+                    + lastHold + ' 分钟</span>' : '');
 }
 
 /* ---------------- 交互 ---------------- */
@@ -426,26 +509,29 @@ function toSvg(evt){
 function hitTest(x, y){
   var p = sorted();
   for(var i = 0; i < p.length; i++){
-    var dx = px(p[i].x) - x, dy = py(p[i].y) - y;
+    var dx = px(p[i].x) - x, dy = pys(p[i].y) - y;
     if(dx*dx + dy*dy <= 144) return i;   // 半径 12 内算命中
   }
   return -1;
 }
 
 function onDown(e){
+  if(e.button !== 0) return;              // 只响应左键，右键交给 contextmenu
   var c = toSvg(e), i = hitTest(c.x, c.y);
   if(i >= 0){
     dragIdx = i;
-    svgEl.setPointerCapture && svgEl.setPointerCapture(e.pointerId);
+    if(svgEl.setPointerCapture) svgEl.setPointerCapture(e.pointerId);
     drawSch();
   }else{
-    /* 空白处点击 = 新增控制点（y 取该时刻曲线上的当前值） */
+    /* 空白处单击 = 新增控制点（y 取点击位置反算出的原始值） */
     var h = snap(invX(c.x), STEP);
-    SCH.points.push({x:h, y:Math.round(invY(c.y))});
+    var f = sF() || 1;
+    SCH.points.push({x:h, y:Math.round(clamp(invY(c.y) / f, 0, 100))});
     var p = sorted();
     dragIdx = p.findIndex(function(q){ return q.x === h; });
+    syncEnds(p, dragIdx);          /* 新增的若是端点，另一端跟着走 */
     SCH.points = p;
-    svgEl.setPointerCapture && svgEl.setPointerCapture(e.pointerId);
+    if(svgEl.setPointerCapture) svgEl.setPointerCapture(e.pointerId);
     drawSch();
   }
   e.preventDefault();
@@ -461,7 +547,11 @@ function onMove(e){
   var hi = dragIdx < p.length-1 ? p[dragIdx+1].x - STEP : 24;
   if(lo > hi){ lo = hi; }
   p[dragIdx].x = clamp(h, lo, hi);
-  p[dragIdx].y = Math.round(clamp(invY(c.y), 0, 100));
+
+  /* 图上是缩放后的位置，反算回原始值 */
+  var f = sF() || 1;
+  p[dragIdx].y = Math.round(clamp(invY(c.y) / f, 0, 100));
+  syncEnds(p, dragIdx);          /* 拖到端点时，另一端同步 */
   SCH.points = p;
   drawSch();
   e.preventDefault();
@@ -473,19 +563,48 @@ function onUp(){
   drawSch();
 }
 
-function onDbl(e){
-  var c = toSvg(e), i = hitTest(c.x, c.y);
+function removeAt(i){
   if(i < 0) return;
   if(SCH.points.length <= 2){ toast('至少保留 2 个控制点'); return; }
   var p = sorted();
   p.splice(i, 1);
   SCH.points = p;
+  dragIdx = -1;
   drawSch();
+  toast('已删除控制点');
+}
+
+/* 双击删除 */
+function onDbl(e){
+  var c = toSvg(e);
+  removeAt(hitTest(c.x, c.y));
   e.preventDefault();
 }
 
+/* 右键删除（屏蔽浏览器菜单） */
+function onCtx(e){
+  var c = toSvg(e);
+  e.preventDefault();
+  removeAt(hitTest(c.x, c.y));
+}
+
+/* ---------------- 整体缩放滑轨 ---------------- */
+function onScale(el){
+  SCH.scale = Number(el.value);
+  document.getElementById('schScaleVal').textContent = SCH.scale + '%';
+  drawSch();
+}
+
+function syncScaleUi(){
+  document.getElementById('schScale').value = SCH.scale;
+  document.getElementById('schScaleVal').textContent = SCH.scale + '%';
+}
+
+/* ---------------- 预设 / 保存 ---------------- */
 function preset(name){
   SCH.points = PRESETS[name].map(function(q){ return {x:q.x, y:q.y}; });
+  SCH.scale = 100;                        // 载入预设时缩放复位，避免数值叠加困惑
+  syncScaleUi();
   drawSch();
   toast('已载入预设：' + ({night:'护眼', day:'明亮', flat:'平缓'}[name]));
 }
@@ -493,7 +612,7 @@ function preset(name){
 function onSchToggle(){
   SCH.enabled = document.getElementById('schOn').checked;
   document.getElementById('schNote').innerHTML = SCH.enabled
-    ? '已启用：页面保持打开时，每分钟按曲线自动调节一次。<b>后台（关闭页面也生效）需要 C++ 侧支持，尚未实现。</b>'
+    ? '已启用：页面保持打开时按曲线自动调节。<b>后台（关闭页面也生效）需要 C++ 侧支持，尚未实现。</b>'
     : '未启用自动调节。';
 }
 
@@ -506,6 +625,7 @@ function applyNow(){
 function saveSch(){
   var payload = {
     enabled: document.getElementById('schOn').checked,
+    scale: SCH.scale,
     points: sorted().map(function(p){
       return {x: Math.round(p.x*100)/100, y: Math.round(p.y)};
     })
@@ -521,40 +641,46 @@ function saveSch(){
     document.getElementById('schNote').textContent =
       '配置已写入后台程序（关闭页面后依然生效）。';
   }).catch(function(){
-    toast('已保存到浏览器（后端接口待接入）');
+    toast('后台没保存成功');
     document.getElementById('schNote').innerHTML =
-      '已存到浏览器 localStorage。<b>写入程序配置文件需要后端 /api/schedule 接口，下一步实现。</b>';
+      '后台程序写入配置文件失败（多半是程序所在目录不可写），'
+      + '目前只暂存在这个浏览器里。<b>把程序挪到可写目录再保存一次即可。</b>';
   });
 }
 
-/* 页面开着时的自动调节（前端版，后端实现后可去掉） */
-function tickAuto(){
-  if(!document.getElementById('schOn').checked) return;
-  var want = valueAt(nowHours());
-  if(tickAuto._last !== want){
-    tickAuto._last = want;
-    req('/api/set', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({id:-1, percent:want})
-    }).then(function(d){ applyResult(d); }).catch(function(){});
-  }
+/* 注意：这里刻意不主动写亮度。
+ * 自动调节由后台程序（常驻进程）负责，前端如果也每 15 秒调一次 /api/set，
+ * 每一次都会被后端判定成「用户手动操作」从而刷新 30 分钟免打扰，
+ * 结果就是后端的自动调节被永久压住；而页面一关，用户还得干等 30 分钟才恢复。
+ * 写入只保留给下面这些真正的手动操作：拖滑块 / 拖控制点 / 点预设 / 点「立即应用」。
+ * 页面本身每 3 秒刷一次 /api/state，所以自动调节的结果照样能实时看到。 */
+
+/* 把一份配置灌进 SCH（不重画，由调用方决定何时画） */
+function useSch(d){
+  if(!d || !d.points || d.points.length < 2) return false;
+  SCH.enabled = !!d.enabled;
+  SCH.scale = (typeof d.scale === 'number') ? clamp(d.scale, 10, 100) : 100;
+  SCH.points = d.points.map(function(q){ return {x:+q.x, y:Math.round(q.y)}; });
+  SCH.points = syncEnds(sorted(), 0);   /* 0 点与 24 点是同一时刻，两端强制同值 */
+  document.getElementById('schOn').checked = SCH.enabled;
+  syncScaleUi();
+  return true;
 }
 
 /* ---------------- 初始化 ---------------- */
 (function initSch(){
+  /* 先用浏览器缓存撑住画面，不等网络请求 */
   var saved = null;
   try{ saved = JSON.parse(localStorage.getItem('brightnessctl.schedule')); }catch(e){}
-  if(saved && saved.points && saved.points.length >= 2){
-    SCH.enabled = !!saved.enabled;
-    SCH.points = saved.points.slice();
-  }else{
+  if(!useSch(saved)){
     SCH.enabled = false;
+    SCH.scale = 100;
     SCH.points = PRESETS.night.map(function(q){ return {x:q.x, y:q.y}; });
+    document.getElementById('schOn').checked = false;
+    syncScaleUi();
   }
-  document.getElementById('schOn').checked = SCH.enabled;
   document.getElementById('schNote').textContent =
-    '拖动曲线上的圆点即可设定全天亮度；点“保存”写入配置。';
+    '拖动曲线上的圆点设定全天亮度；「整体缩放」可在原曲线基础上整体升降，不改变曲线形状。';
 
   svgEl = document.getElementById('schSvg');
   svgEl.addEventListener('pointerdown', onDown);
@@ -562,12 +688,23 @@ function tickAuto(){
   svgEl.addEventListener('pointerup', onUp);
   svgEl.addEventListener('pointercancel', onUp);
   svgEl.addEventListener('dblclick', onDbl);
+  svgEl.addEventListener('contextmenu', onCtx);
   drawSch();
+
+  /* 再以后台程序的配置为准：清了浏览器缓存、换台机器打开，拿到的都是同一份 */
+  req('/api/schedule').then(function(d){
+    if(useSch(d)){
+      drawSch();
+      document.getElementById('schNote').textContent =
+        '已读取后台程序的作息曲线配置（存在程序侧，关掉页面依然生效）。';
+    }
+  }).catch(function(){});
 })();
 
 load();
 setInterval(function(){ if(!dragging) load(false); }, 3000);
-setInterval(function(){ drawSch(); tickAuto(); }, 15000);
+/* 只重画曲线（让「现在」这条竖线跟着走）；拖动中不重画，否则拖到一半元素被替换 */
+setInterval(function(){ if(!dragging) drawSch(); }, 15000);
 </script>
 </body>
 </html>
