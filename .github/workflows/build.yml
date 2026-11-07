@@ -1,0 +1,87 @@
+name: build
+
+# 触发时机：
+#   push 到 main        -> 编译并上传 artifact（30 天）
+#   push tag v1.0.2     -> 编译 + 上传 artifact + 发布 Release
+#   提 PR / 手动点击     -> 只编译，验证代码没编坏
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Windows / MinGW-w64
+    runs-on: windows-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # GitHub 的 Windows runner 预装了 MSYS2，但没有 MinGW-w64 编译器，
+      # 这里用 pacman 装一份。装完的 g++.exe 位于 C:\msys64\mingw64\bin。
+      - name: 准备 MinGW-w64 工具链
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-make
+
+      # CMakeLists 要求 MinGW 的 bin 必须在 PATH 里，且 configure 和 build
+      # 是两个独立进程，所以必须在 shell 层面加，写在 CMake 里只对一半生效。
+      - name: 把 MinGW 加进 PATH
+        shell: bash
+        run: echo "C:/msys64/mingw64/bin" >> "$GITHUB_PATH"
+
+      # tag 名就是版本号：refs/tags/v1.0.2 -> 1.0.2
+      # 非 tag 的构建（main / PR / 手动）统一用 0.0.0，表示非正式版
+      - name: 计算版本号
+        id: ver
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            version="${GITHUB_REF#refs/tags/}"
+            version="${version#v}"
+          else
+            version="0.0.0"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "build=$GITHUB_RUN_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "版本号: $version (build $GITHUB_RUN_NUMBER)"
+
+      - name: CMake 配置
+        run: >
+          cmake -S . -B build -G "MinGW Makefiles"
+          -DMINGW_BIN=C:/msys64/mingw64/bin
+          -DAPP_VERSION=${{ steps.ver.outputs.version }}
+          -DAPP_BUILD=${{ steps.ver.outputs.build }}
+
+      - name: 编译
+        run: cmake --build build
+
+      # CI 上没有真实显示器，只能验证 exe 能启动、能打印帮助
+      - name: 冒烟测试
+        run: .\build\brightnessctl.exe --help
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: brightnessctl-${{ steps.ver.outputs.version }}-build${{ steps.ver.outputs.build }}
+          path: build/brightnessctl.exe
+          retention-days: 30
+
+      - name: 发布到 Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/brightnessctl.exe
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
