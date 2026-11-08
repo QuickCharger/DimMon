@@ -1,6 +1,6 @@
 # DimMon — brightnessctl
 
-Windows 显示器亮度控制工具：一个**运行时零依赖的单文件 exe**（约 480 KB），不装运行时、不写注册表、不留后台服务。
+Windows 显示器亮度控制工具：一个**运行时零依赖的单文件 exe**，不装运行时、不写注册表、不留后台服务。
 
 两种用法：
 
@@ -23,73 +23,32 @@ Windows 显示器亮度控制工具：一个**运行时零依赖的单文件 exe
 
 ---
 
-## 编译
+## 构建（给 AI / 自动化代理读的操作规范）
 
-用 **CMake + MinGW-w64**（GCC 需支持 C++17；Qt 6.8.3 附带的 MinGW 13.1.0 即可）。
-不需要 MSVC、不需要 Windows SDK、不需要 Qt 库本体 —— 项目只借 Qt 自带的 GCC 编译器，不链接任何 Qt 库。
+> 本节是给 AI / 自动化代理读的执行规范，人也可以照着做。
+> 项目里**没有任何构建脚本**，`CMakeLists.txt` 不假设任何路径、工具链型号或生成器。
+> **执行者按自己电脑的实际环境配置工具链与构建参数，再执行下面的命令；
+> 不要修改 `CMakeLists.txt`，也不要新建构建脚本。**
+
+### 1. 需要的工具
+
+- **MinGW**（Windows 上的 C++ 编译器）
+- **CMake** ≥ 3.16
+
+用哪个发行版、装在哪里、怎样让终端能调用它们，全部由执行者按本机环境决定。
+
+### 2. 构建
 
 ```bat
-set PATH=D:\git\tools\Qt\Qt6.8.3\Tools\mingw1310_64\bin;%PATH%
-
-cmake -S . -B build -G "MinGW Makefiles"
+cmake -S . -B build
 cmake --build build
 ```
 
-产物：`build\brightnessctl.exe`（约 480 KB，静态链接的自包含单文件）。
+按本机环境自行补充所需参数（生成器、工具链位置等）；可选项的含义见 `CMakeLists.txt` 内注释。
+第三方依赖由 CMake 在 configure 阶段自动获取，通常不需要额外参数。
 
-> 第一行不是可选的装饰 —— **MinGW 的 `bin` 必须在 PATH 里**。
-> `cc1.exe` / `cc1plus.exe` 位于 `libexec\gcc\...\`，但它们依赖的 `libwinpthread-1.dll` 只在 `bin\` 下；
-> 不在 PATH 时 gcc 会**静默失败**（只返回退出码，无任何报错）。
-> `CMakeLists.txt` 会提前检查这一点，缺了就直接给出上面的 `set PATH=...` 提示，不会让你去猜 CMake 那句 "compiler is broken"。
-> 另外，PATH 里若混进其他工具链（如 `C:\cygwin64\bin` 自带的 gcc/g++）也会干扰构建，遇到怪问题先把 PATH 清干净。
-
-### 指定工具链
-
-`CMakeLists.txt` 按以下顺序找 MinGW，找不到会在 configure 阶段直接报 fatal error：
-
-1. `-DMINGW_BIN=<mingw 的 bin 目录>`
-2. 环境变量 `MINGW`
-3. 默认 `D:\git\tools\Qt\Qt6.8.3\Tools\mingw1310_64\bin`
-4. 回退 `C:\Qt\Qt6.8.3\Tools\mingw1310_64\bin`
-
-```bat
-cmake -S . -B build -G "MinGW Makefiles" -DMINGW_BIN=D:\git\tools\Qt\Qt6.8.3\Tools\mingw1310_64\bin
-```
-
-### 依赖什么
-
-**构建工具**
-
-- **CMake** ≥ 3.16（本机用的是 Qt 自带的 3.30.5：`C:\Qt\Qt6.8.3\Tools\CMake_64\bin\cmake.exe`）
-- **MinGW-w64** 工具链：`g++`、`windres`、`mingw32-make`（都在 Qt 的 `mingw1310_64\bin` 里）
-
-**第三方代码**
-
-- [nlohmann/json](https://github.com/nlohmann/json) v3.12.0（MIT，header-only）—— 只用于 JSON 序列化。
-
-它**不在本仓库里**：CMake 的 `FetchContent` 在 configure 阶段把它下载到 `build/_deps/`，
-而 `build/` 已被 `.gitignore` 忽略，所以仓库里只有 CMakeLists 那几行声明
-（地址 + 版本 + SHA256 校验值），没有任何第三方源码。首次 configure 需要联网。
-
-> 国内直连 `github.com` 实测超时（curl 返回 000），默认走 `ghfast.top` 镜像。
-> 如果你那边能直连，覆盖地址即可：
->
-> ```bat
-> cmake -S . -B build -G "MinGW Makefiles" ^
->       -DNLOHMANN_URL=https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz
-> ```
->
-> 想完全离线构建：把单头文件 `json.hpp` 放到 `third_party/nlohmann/` 下，
-> `CMakeLists.txt` 会自动改用它，跳过一切下载（放好后要重新跑一次
-> `cmake -S . -B build`，因为那个判断发生在 configure 阶段）。
-
-### 获取 MinGW
-
-若不想装整套 Qt，可直接下载官方 7z（约 107 MB，解压 619 MB），解压后把里面的 `Tools\mingw1310_64` 放到任意目录即可：
-
-```
-https://download.qt.io/online/qtsdkrepository/windows_x86/desktop/tools_mingw1310/qt.tools.win64_mingw1310/13.1.0-202407240918mingw1310.7z
-```
+产物：`build\brightnessctl.exe`（静态链接的自包含单文件）。
+执行 `build\brightnessctl.exe help` 可验证可运行；`objdump -p` 可确认是 PE32+ 且只依赖系统 DLL。
 
 ---
 
@@ -204,7 +163,7 @@ https://download.qt.io/online/qtsdkrepository/windows_x86/desktop/tools_mingw131
 | `brightnessctl.rc` | 资源脚本：版本信息、图标、内嵌 UI 页面 |
 | `brightnessctl.manifest` | DPI 感知与公共控件 v6 清单 |
 | `brightnessctl.ico` | 程序图标 |
-| `CMakeLists.txt` | 构建脚本：工具链选择、资源编译、第三方依赖获取（FetchContent）、静态链接与安全加固选项 |
+| `CMakeLists.txt` | 平台无关的构建脚本：资源编译、依赖获取（FetchContent）、静态链接与安全加固；工具链由外部指定（见「构建」一节） |
 
 第三方代码（nlohmann/json）不在仓库里，由 CMake 下载到 `build\_deps\`；
 想离线构建时才需要自己放 `third_party\nlohmann\json.hpp`。
